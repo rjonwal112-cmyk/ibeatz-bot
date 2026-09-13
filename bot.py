@@ -1,6 +1,13 @@
 import asyncio
 import logging
+import os
+import signal
 import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -48,12 +55,6 @@ from downloader import (
     cancel_all_active_downloads,
     cleanup_orphaned_temp_dirs,
 )
-
-import os
-import signal
-import threading
-import time
-from typing import Optional
 from flask import Flask
 from werkzeug.serving import make_server
 
@@ -339,8 +340,6 @@ async def main() -> None:
     ]
 
     # Print comprehensive process and runtime diagnostics
-    import os
-    from pathlib import Path
     registered_router_names = [r.name for r in dp.sub_routers]
     registered_command_names = [f"/{c.command}" for c in user_commands]
     print("=" * 60)
