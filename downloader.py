@@ -2,16 +2,19 @@ import asyncio
 import copy
 import hashlib
 import html
+import json
 import logging
 import mimetypes
+import os
 import re
 import shutil
+import subprocess
 import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import yt_dlp
 
@@ -776,6 +779,103 @@ def format_extraction_error(error: Any, url: str = "") -> str:
     return "❌ Media extraction failed. Please check if the link is accessible."
 
 
+def categorize_error(error: Any) -> tuple[str, str]:
+    """
+    Distinguishes error causes into distinct technical categories:
+    - extractor failure
+    - no usable formats
+    - source unavailable/restricted
+    - rate limiting
+    - network error
+    - Telegram upload error
+    Returns: (category_name, error_code)
+    """
+    err_str = str(error).strip()
+    err_lower = err_str.lower()
+
+    if any(k in err_lower for k in ("telegram", "send_media_group", "reply_video", "reply_photo", "answer_media_group", "upload to telegram")):
+        return "Telegram upload error", "TELEGRAM_UPLOAD_ERROR"
+
+    if any(k in err_lower for k in ("429", "too many requests", "rate limit", "temporarily blocked", "exceeded the rate-limit")):
+        return "rate limiting", "RATE_LIMITING"
+
+    if any(k in err_lower for k in (
+        "private account", "this account is private", "only approved followers",
+        "login required", "please log in", "checkpoint_required", "redirected to login",
+        "age-restricted", "sensitive content", "viewer discretion", "must be 18",
+        "not found", "deleted", "unavailable", "404", "content isn't available",
+        "geo-restricted", "geoblocked", "not available in your region"
+    )):
+        return "source unavailable/restricted", "SOURCE_RESTRICTED"
+
+    if any(k in err_lower for k in (
+        "connection", "timed out", "timeout", "socket", "ssl", "dns",
+        "name resolution", "temporary failure in name", "network is unreachable", "remote host"
+    )):
+        return "network error", "NETWORK_ERROR"
+
+    if any(k in err_lower for k in (
+        "no video formats found", "requested format is not available",
+        "no usable format", "there is no video in this post", "no video in this post", "there is no video"
+    )):
+        return "no usable formats", "NO_USABLE_FORMATS"
+
+    return "extractor failure", "EXTRACTOR_FAILURE"
+
+
+def probe_media_streams(file_path: Optional[Path]) -> tuple[bool, bool]:
+    """
+    Probes file using ffprobe or ffmpeg to verify whether video and audio streams exist.
+    Returns: (has_video_stream, has_audio_stream)
+    """
+    if not file_path or not file_path.exists() or file_path.stat().st_size == 0:
+        return False, False
+
+    ffmpeg_bin = resolve_ffmpeg_path()
+    ffprobe_bin = None
+    if ffmpeg_bin:
+        ffprobe_cand = Path(ffmpeg_bin).parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if ffprobe_cand.exists():
+            ffprobe_bin = str(ffprobe_cand)
+        else:
+            ffprobe_which = shutil.which("ffprobe")
+            if ffprobe_which:
+                ffprobe_bin = ffprobe_which
+
+    if ffprobe_bin:
+        try:
+            cmd = [
+                ffprobe_bin,
+                "-v", "error",
+                "-show_entries", "stream=codec_type",
+                "-of", "json",
+                str(file_path),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                streams = data.get("streams", [])
+                has_video = any(s.get("codec_type") == "video" for s in streams)
+                has_audio = any(s.get("codec_type") == "audio" for s in streams)
+                return has_video, has_audio
+        except Exception as probe_err:
+            logger.debug(f"ffprobe check failed for {file_path}: {probe_err}")
+
+    if ffmpeg_bin and Path(ffmpeg_bin).exists():
+        try:
+            cmd = [ffmpeg_bin, "-i", str(file_path)]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            output = res.stderr.lower()
+            has_video = "video:" in output or ("stream #0:" in output and "video" in output)
+            has_audio = "audio:" in output or ("stream #0:" in output and "audio" in output)
+            return has_video, has_audio
+        except Exception:
+            pass
+
+    ext = file_path.suffix.lower()
+    return ext in (".mp4", ".mkv", ".webm", ".mov"), ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".aac")
+
+
 
 def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional[str]]:
     """Synchronous fast info extraction without downloading media."""
@@ -847,8 +947,9 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         carousel_items = []
         media_type = "video"
 
-        entries = info.get("entries")
-        if entries and len(entries) > 1:
+        # Safely convert entries generator/iterable to concrete list to avoid len() crashes
+        entries = list(info.get("entries") or [])
+        if len(entries) > 1:
             is_carousel = True
             media_type = "carousel"
             for idx, entry in enumerate(entries):
@@ -859,13 +960,18 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
                 item_type = "video" if item_is_video else "photo"
                 item_url = None
                 if item_is_video:
-                    if formats:
+                    valid_prog = [f for f in formats if f.get("url") and f.get("vcodec") != "none" and f.get("acodec") not in (None, "none")]
+                    if valid_prog:
+                        item_url = valid_prog[-1].get("url")
+                    elif formats:
                         item_url = formats[-1].get("url")
                     if not item_url:
                         item_url = entry.get("webpage_url") or entry.get("url") or url
                 else:
-                    if entry.get("thumbnails"):
-                        item_url = entry["thumbnails"][-1].get("url")
+                    valid_thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
+                    if valid_thumbs:
+                        best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                        item_url = best_thumb.get("url")
                     elif entry.get("url"):
                         item_url = entry.get("url")
 
@@ -885,7 +991,7 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
             has_audio = any(it.get("type") == "video" for it in carousel_items)
             primary_entry = entries[0]
         else:
-            if entries and len(entries) == 1:
+            if len(entries) == 1:
                 info = entries[0]
             primary_entry = info
 
@@ -895,8 +1001,10 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
             if not has_video:
                 media_type = "photo"
                 photo_url = None
-                if info.get("thumbnails"):
-                    photo_url = info["thumbnails"][-1].get("url")
+                valid_thumbs = [t for t in (info.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
+                if valid_thumbs:
+                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                    photo_url = best_thumb.get("url")
                 elif info.get("url"):
                     photo_url = info.get("url")
                 logger.info("media_type: photo")
@@ -918,6 +1026,14 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
                 logger.info(f"available formats: {len(formats)}")
                 logger.info(f"selected format: {max_quality}")
                 logger.info(f"extension: {info.get('ext') or 'mp4'}")
+
+        # Structured diagnostic logging for all extracted media
+        logger.info(f"canonical URL: {url}")
+        logger.info(f"extractor result type: {'playlist' if is_carousel else media_type}")
+        logger.info(f"format count: {len(carousel_items) if is_carousel else len(info.get('formats') or [])}")
+        logger.info(f"selected format: {max_quality}")
+        logger.info(f"whether video stream exists: {'YES' if (has_audio or (not is_carousel and has_video)) else 'NO'}")
+        logger.info(f"whether audio stream exists: {'YES' if has_audio else 'NO'}")
 
         extraction_time_s = time.time() - t_start
 
@@ -948,10 +1064,28 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         return True, media_info, None
 
     except yt_dlp.utils.DownloadError as e:
+        err_cat, err_code = categorize_error(e)
         logger.error(f"Preview extraction DownloadError for {url}: {e}", exc_info=True)
+        logger.error(f"canonical URL: {url}")
+        logger.error(f"extractor result type: {platform_info.key}")
+        logger.error("format count: 0")
+        logger.error("selected format: N/A")
+        logger.error("whether video stream exists: NO")
+        logger.error("whether audio stream exists: NO")
+        logger.error(f"final exception/error: {type(e).__name__}: {e}")
+        logger.error(f"error category: {err_cat}")
         return False, None, format_extraction_error(e, url)
     except Exception as e:
+        err_cat, err_code = categorize_error(e)
         logger.error(f"Unexpected preview error for {url}: {e}", exc_info=True)
+        logger.error(f"canonical URL: {url}")
+        logger.error(f"extractor result type: {platform_info.key}")
+        logger.error("format count: 0")
+        logger.error("selected format: N/A")
+        logger.error("whether video stream exists: NO")
+        logger.error("whether audio stream exists: NO")
+        logger.error(f"final exception/error: {type(e).__name__}: {e}")
+        logger.error(f"error category: {err_cat}")
         return False, None, format_extraction_error(e, url)
 
 
@@ -1053,8 +1187,47 @@ def _sync_download(
     # 1. CAROUSEL PIPELINE (Requirement 7)
     # -------------------------------------------------------------
     if is_carousel:
-        logger.info(f"Entering carousel download pipeline: {len(cached_info.get('carousel_items', []))} items")
-        carousel_items = cached_info.get("carousel_items", [])
+        carousel_items = cached_info.get("carousel_items", []) if cached_info else []
+        if not carousel_items and cached_info and "entries" in cached_info:
+            c_entries = list(cached_info.get("entries") or [])
+            if len(c_entries) > 1:
+                carousel_items = []
+                for idx, entry in enumerate(c_entries):
+                    if not entry:
+                        continue
+                    formats = entry.get("formats") or []
+                    item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
+                    item_type = "video" if item_is_video else "photo"
+                    item_url = None
+                    if item_is_video:
+                        valid_prog = [f for f in formats if f.get("url") and f.get("vcodec") != "none" and f.get("acodec") not in (None, "none")]
+                        if valid_prog:
+                            item_url = valid_prog[-1].get("url")
+                        elif formats:
+                            item_url = formats[-1].get("url")
+                        if not item_url:
+                            item_url = entry.get("webpage_url") or entry.get("url") or url
+                    else:
+                        valid_thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
+                        if valid_thumbs:
+                            best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                            item_url = best_thumb.get("url")
+                        elif entry.get("url"):
+                            item_url = entry.get("url")
+                    carousel_items.append({
+                        "index": idx,
+                        "id": entry.get("id", f"item_{idx}"),
+                        "type": item_type,
+                        "url": item_url,
+                        "raw_entry": entry,
+                    })
+
+        logger.info(f"canonical URL: {url}")
+        logger.info("extractor result type: playlist")
+        logger.info(f"format count: {len(carousel_items)}")
+        logger.info("selected format: highest")
+        logger.info(f"Entering carousel download pipeline: {len(carousel_items)} items")
+
         carousel_files: list[tuple[str, Path]] = []
         for it in carousel_items:
             idx = it["index"]
@@ -1080,7 +1253,7 @@ def _sync_download(
                             f.write(resp.read())
                         item_size = item_file.stat().st_size
                         if item_file.exists() and item_size > 0:
-                            logger.info(f"carousel item download success: True")
+                            logger.info("carousel item download success: True")
                             logger.info(f"carousel item local path: {item_file}")
                             carousel_files.append(("photo", item_file))
                         else:
@@ -1125,7 +1298,10 @@ def _sync_download(
                             downloaded_ok = True
 
                     if downloaded_ok and item_file.exists() and item_file.stat().st_size > 0:
-                        logger.info(f"carousel item download success: True")
+                        has_v, has_a = probe_media_streams(item_file)
+                        logger.info("carousel item download success: True")
+                        logger.info(f"carousel item video stream: {'YES' if has_v else 'NO'}")
+                        logger.info(f"carousel item audio stream: {'YES' if has_a else 'NO'}")
                         logger.info(f"carousel item local path: {item_file}")
                         carousel_files.append(("video", item_file))
                     else:
@@ -1145,8 +1321,8 @@ def _sync_download(
         record_download_finish(success=True)
         primary_file = carousel_files[0][1]
         media_info = MediaInfo(
-            title=cached_info.get("title", "Carousel"),
-            uploader=cached_info.get("uploader", "Creator"),
+            title=(cached_info.get("title") if cached_info else None) or "Carousel",
+            uploader=(cached_info.get("uploader") if cached_info else None) or "Creator",
             duration=None,
             thumbnail=None,
             filesize_approx=sum(p.stat().st_size for _, p in carousel_files),
@@ -1159,6 +1335,10 @@ def _sync_download(
             is_carousel=True,
             media_type="carousel",
         )
+
+        logger.info(f"whether video stream exists: {'YES' if any(t == 'video' for t, _ in carousel_files) else 'NO'}")
+        logger.info(f"whether audio stream exists: {'YES' if any(t == 'video' for t, _ in carousel_files) else 'NO'}")
+
         return DownloadResult(
             success=True,
             file_path=primary_file,
@@ -1177,7 +1357,12 @@ def _sync_download(
         photo_url = None
         if cached_info:
             if cached_info.get("thumbnails"):
-                photo_url = cached_info["thumbnails"][-1].get("url")
+                valid_thumbs = [t for t in cached_info["thumbnails"] if isinstance(t, dict) and t.get("url")]
+                if valid_thumbs:
+                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                    photo_url = best_thumb.get("url")
+                else:
+                    photo_url = cached_info["thumbnails"][-1].get("url")
             elif cached_info.get("url"):
                 photo_url = cached_info.get("url")
 
@@ -1192,10 +1377,26 @@ def _sync_download(
                 }) as ydl_p:
                     raw_p = ydl_p.extract_info(url, download=False, process=False)
                     if raw_p:
-                        entries_p = raw_p.get("entries") or [raw_p]
+                        entries_p = list(raw_p.get("entries") or [raw_p])
+                        if len(entries_p) > 1:
+                            logger.info(f"Detected multi-item carousel ({len(entries_p)} items) in photo fallback, routing to carousel pipeline...")
+                            raw_p["is_carousel"] = True
+                            return _sync_download(
+                                url=url,
+                                user_id=user_id,
+                                quality=quality,
+                                req_id=req_id,
+                                progress_callback=progress_callback,
+                                cached_info=raw_p,
+                            )
                         e0 = entries_p[0]
                         if e0.get("thumbnails"):
-                            photo_url = e0["thumbnails"][-1].get("url")
+                            valid_thumbs = [t for t in e0["thumbnails"] if isinstance(t, dict) and t.get("url")]
+                            if valid_thumbs:
+                                best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                                photo_url = best_thumb.get("url")
+                            else:
+                                photo_url = e0["thumbnails"][-1].get("url")
                         elif e0.get("url"):
                             photo_url = e0.get("url")
             except Exception as e:
@@ -1230,6 +1431,12 @@ def _sync_download(
                     f.write(data)
 
                 d_size = len(data)
+                logger.info(f"canonical URL: {url}")
+                logger.info("extractor result type: photo")
+                logger.info("format count: 1")
+                logger.info("selected format: photo")
+                logger.info("whether video stream exists: NO")
+                logger.info("whether audio stream exists: NO")
                 logger.info(f"image content-type: {ctype}")
                 logger.info(f"HTTP status: {status}")
                 logger.info(f"downloaded size: {d_size} bytes")
@@ -1400,51 +1607,59 @@ def _sync_download(
                     temp_dir=temp_dir,
                 )
 
-            if "entries" in info_dict and len(info_dict["entries"]) > 1:
-                logger.info(f"Multi-item carousel detected ({len(info_dict['entries'])} items), routing to carousel pipeline...")
-                carousel_items = []
-                for idx, entry in enumerate(info_dict["entries"]):
-                    if not entry:
-                        continue
-                    formats = entry.get("formats") or []
-                    item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
-                    item_type = "video" if item_is_video else "photo"
-                    item_url = None
-                    if item_is_video:
-                        if formats:
-                            item_url = formats[-1].get("url")
-                        if not item_url:
-                            item_url = entry.get("webpage_url") or entry.get("url") or url
-                    else:
-                        if entry.get("thumbnails"):
-                            item_url = entry["thumbnails"][-1].get("url")
-                        elif entry.get("url"):
-                            item_url = entry.get("url")
-                    carousel_items.append({
-                        "index": idx,
-                        "id": entry.get("id", f"item_{idx}"),
-                        "type": item_type,
-                        "url": item_url,
-                        "raw_entry": entry,
-                    })
-                info_dict["is_carousel"] = True
-                info_dict["carousel_items"] = carousel_items
-                info_dict["media_type"] = "carousel"
-                return _sync_download(
-                    url=url,
-                    user_id=user_id,
-                    quality=quality,
-                    req_id=req_id,
-                    progress_callback=progress_callback,
-                    cached_info=info_dict,
-                )
-
-            if "entries" in info_dict and info_dict["entries"]:
-                video_entry = next(
-                    (e for e in info_dict["entries"] if e and (e.get("vcodec") != "none" or e.get("formats"))),
-                    info_dict["entries"][0],
-                )
-                info_dict = video_entry
+            raw_entries = info_dict.get("entries")
+            if raw_entries is not None:
+                entries_list = [e for e in raw_entries if e]
+                info_dict["entries"] = entries_list
+                if len(entries_list) > 1:
+                    logger.info(f"Multi-item carousel detected ({len(entries_list)} items), routing to carousel pipeline...")
+                    carousel_items = []
+                    for idx, entry in enumerate(entries_list):
+                        if not entry:
+                            continue
+                        formats = entry.get("formats") or []
+                        item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
+                        item_type = "video" if item_is_video else "photo"
+                        item_url = None
+                        if item_is_video:
+                            if formats:
+                                item_url = formats[-1].get("url")
+                            if not item_url:
+                                item_url = entry.get("webpage_url") or entry.get("url") or url
+                        else:
+                            if entry.get("thumbnails"):
+                                valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
+                                if valid_thumbs:
+                                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                                    item_url = best_thumb.get("url")
+                                else:
+                                    item_url = entry["thumbnails"][-1].get("url")
+                            elif entry.get("url"):
+                                item_url = entry.get("url")
+                        carousel_items.append({
+                            "index": idx,
+                            "id": entry.get("id", f"item_{idx}"),
+                            "type": item_type,
+                            "url": item_url,
+                            "raw_entry": entry,
+                        })
+                    info_dict["is_carousel"] = True
+                    info_dict["carousel_items"] = carousel_items
+                    info_dict["media_type"] = "carousel"
+                    return _sync_download(
+                        url=url,
+                        user_id=user_id,
+                        quality=quality,
+                        req_id=req_id,
+                        progress_callback=progress_callback,
+                        cached_info=info_dict,
+                    )
+                elif len(entries_list) == 1:
+                    video_entry = next(
+                        (e for e in entries_list if e and (e.get("vcodec") != "none" or e.get("formats"))),
+                        entries_list[0],
+                    )
+                    info_dict = video_entry
 
             media_info = MediaInfo(
                 title=info_dict.get("title", "Media"),
@@ -1507,6 +1722,18 @@ def _sync_download(
             logger.info(f"file size: {file_size}")
             logger.info(f"correct media extension: {ext in ('.mp4', '.mkv', '.webm', '.mov', '.m4a', '.mp3')}")
 
+            # Probe media streams to verify sound/video presence
+            has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+            logger.info(
+                f"[VIDEO VERIFICATION] file={downloaded_file.name}, size={file_size}, "
+                f"has_video={has_v_stream}, has_audio={has_a_stream}, ext={ext}"
+            )
+            logger.info(
+                f"[DIAGNOSTICS] URL: {url} | ResultType: {info_dict.get('_type', 'video')} | "
+                f"Formats: {len(info_dict.get('formats') or [])} | SelectedFormat: {info_dict.get('format_id')} | "
+                f"VideoStream: {has_v_stream} | AudioStream: {has_a_stream} | Error: None"
+            )
+
             # Enforce Telegram file-size limit
             if file_size > MAX_FILE_SIZE_BYTES:
                 record_download_finish(success=False)
@@ -1563,43 +1790,64 @@ def _sync_download(
             logger.info(f"No video format found for {url}, routing to photo/carousel fallback pipeline...")
             cached_ie = getattr(ydl, "_last_ie_result", None)
             if cached_ie:
-                if "entries" in cached_ie and len(cached_ie["entries"]) > 1:
-                    carousel_items = []
-                    for idx, entry in enumerate(cached_ie["entries"]):
-                        if not entry:
-                            continue
-                        formats = entry.get("formats") or []
-                        item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
-                        item_type = "video" if item_is_video else "photo"
-                        item_url = None
-                        if item_is_video:
-                            if formats:
-                                item_url = formats[-1].get("url")
-                            if not item_url:
-                                item_url = entry.get("webpage_url") or entry.get("url") or url
-                        else:
-                            if entry.get("thumbnails"):
-                                item_url = entry["thumbnails"][-1].get("url")
-                            elif entry.get("url"):
-                                item_url = entry.get("url")
-                        carousel_items.append({
-                            "index": idx,
-                            "id": entry.get("id", f"item_{idx}"),
-                            "type": item_type,
-                            "url": item_url,
-                            "raw_entry": entry,
-                        })
-                    cached_ie["is_carousel"] = True
-                    cached_ie["carousel_items"] = carousel_items
-                    cached_ie["media_type"] = "carousel"
-                    return _sync_download(
-                        url=url,
-                        user_id=user_id,
-                        quality=quality,
-                        req_id=req_id,
-                        progress_callback=progress_callback,
-                        cached_info=cached_ie,
-                    )
+                raw_c_entries = cached_ie.get("entries")
+                if raw_c_entries is not None:
+                    c_entries = [e for e in raw_c_entries if e]
+                    cached_ie["entries"] = c_entries
+                    if len(c_entries) > 1:
+                        carousel_items = []
+                        for idx, entry in enumerate(c_entries):
+                            if not entry:
+                                continue
+                            formats = entry.get("formats") or []
+                            item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
+                            item_type = "video" if item_is_video else "photo"
+                            item_url = None
+                            if item_is_video:
+                                if formats:
+                                    item_url = formats[-1].get("url")
+                                if not item_url:
+                                    item_url = entry.get("webpage_url") or entry.get("url") or url
+                            else:
+                                if entry.get("thumbnails"):
+                                    valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
+                                    if valid_thumbs:
+                                        best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                                        item_url = best_thumb.get("url")
+                                    else:
+                                        item_url = entry["thumbnails"][-1].get("url")
+                                elif entry.get("url"):
+                                    item_url = entry.get("url")
+                            carousel_items.append({
+                                "index": idx,
+                                "id": entry.get("id", f"item_{idx}"),
+                                "type": item_type,
+                                "url": item_url,
+                                "raw_entry": entry,
+                            })
+                        cached_ie["is_carousel"] = True
+                        cached_ie["carousel_items"] = carousel_items
+                        cached_ie["media_type"] = "carousel"
+                        return _sync_download(
+                            url=url,
+                            user_id=user_id,
+                            quality=quality,
+                            req_id=req_id,
+                            progress_callback=progress_callback,
+                            cached_info=cached_ie,
+                        )
+                    elif len(c_entries) == 1:
+                        cached_ie = c_entries[0]
+                        cached_ie["media_type"] = "photo"
+                        cached_ie["is_carousel"] = False
+                        return _sync_download(
+                            url=url,
+                            user_id=user_id,
+                            quality="photo",
+                            req_id=req_id,
+                            progress_callback=progress_callback,
+                            cached_info=cached_ie,
+                        )
                 else:
                     cached_ie["media_type"] = "photo"
                     cached_ie["is_carousel"] = False
@@ -1649,28 +1897,49 @@ def _sync_download(
                         cached_info=fb_info,
                     )
             except Exception as fb_err:
+                err_cat, err_code = categorize_error(fb_err)
+                logger.warning(
+                    f"[DIAGNOSTICS] URL: {url} | ResultType: fallback_error | "
+                    f"Formats: 0 | SelectedFormat: None | "
+                    f"VideoStream: False | AudioStream: False | "
+                    f"Category: {err_cat} | ErrorCode: {err_code} | Error: {fb_err}"
+                )
                 msg = format_extraction_error(fb_err, url)
                 return DownloadResult(
                     success=False,
-                    error_code="DOWNLOAD_ERROR",
+                    error_code=err_code,
                     error_message=msg,
                     temp_dir=temp_dir,
                 )
 
+        err_cat, err_code = categorize_error(e)
+        logger.warning(
+            f"[DIAGNOSTICS] URL: {url} | ResultType: download_error | "
+            f"Formats: 0 | SelectedFormat: None | "
+            f"VideoStream: False | AudioStream: False | "
+            f"Category: {err_cat} | ErrorCode: {err_code} | Error: {e}"
+        )
         msg = format_extraction_error(e, url)
         return DownloadResult(
             success=False,
-            error_code="DOWNLOAD_ERROR",
+            error_code=err_code,
             error_message=msg,
             temp_dir=temp_dir,
         )
 
     except Exception as e:
         record_download_finish(success=False)
+        err_cat, err_code = categorize_error(e)
+        logger.warning(
+            f"[DIAGNOSTICS] URL: {url} | ResultType: unexpected_error | "
+            f"Formats: 0 | SelectedFormat: None | "
+            f"VideoStream: False | AudioStream: False | "
+            f"Category: {err_cat} | ErrorCode: {err_code} | Error: {e}"
+        )
         logger.error(f"Unexpected download error for {url}: {e}", exc_info=True)
         return DownloadResult(
             success=False,
-            error_code="UNKNOWN_ERROR",
+            error_code=err_code,
             error_message=format_extraction_error(e, url),
             temp_dir=temp_dir,
         )

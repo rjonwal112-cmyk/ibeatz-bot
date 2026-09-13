@@ -524,41 +524,77 @@ async def _download_and_deliver(
         # CASE 1: Instagram / Multi-item Carousel (Requirement 7)
         # -----------------------------------------------------------------
         if result.is_carousel and len(result.carousel_files) > 1:
-            logger.info(f"Preparing Telegram media group for carousel: {len(result.carousel_files)} items")
-            media_group = []
-            for idx, (itype, ipath) in enumerate(result.carousel_files):
-                item_cap = caption if idx == 0 else None
-                if itype == "photo":
-                    media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
+            valid_files = [(itype, ipath) for itype, ipath in result.carousel_files if ipath and ipath.exists()]
+            if not valid_files:
+                logger.error("No valid carousel files found for Telegram upload.")
+                job_queue.finish_job(req_id, success=False, error="No valid carousel files")
+                if status_msg:
+                    await status_msg.edit_text("❌ Couldn't find downloaded files to upload.")
+                return
+
+            logger.info(f"Preparing Telegram delivery for carousel: {len(valid_files)} items")
+            total_sent = 0
+            # Telegram media groups allow 2 to 10 items per group
+            chunks = [valid_files[i:i + 10] for i in range(0, len(valid_files), 10)]
+
+            for c_idx, chunk in enumerate(chunks):
+                if len(chunk) >= 2:
+                    media_group = []
+                    for idx, (itype, ipath) in enumerate(chunk):
+                        # Caption attached ONLY to the first item of the first chunk
+                        item_cap = caption if (c_idx == 0 and idx == 0) else None
+                        if itype == "photo":
+                            media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
+                        else:
+                            media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
+
+                    try:
+                        sent = await message.reply_media_group(media=media_group, request_timeout=300)
+                        total_sent += len(chunk)
+                    except Exception as mg_err:
+                        logger.warning(f"reply_media_group chunk {c_idx} failed ({mg_err}), attempting answer_media_group")
+                        try:
+                            sent = await message.answer_media_group(media=media_group, request_timeout=300)
+                            total_sent += len(chunk)
+                        except Exception as final_mg_err:
+                            logger.error(f"[Telegram upload error] media group chunk {c_idx} send failed: {final_mg_err}", exc_info=True)
+                            # Fallback: send items individually if media group failed
+                            for idx, (itype, ipath) in enumerate(chunk):
+                                item_cap = caption if (c_idx == 0 and idx == 0 and total_sent == 0) else None
+                                mf = FSInputFile(ipath, chunk_size=524288)
+                                try:
+                                    if itype == "photo":
+                                        await message.reply_photo(photo=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                                    else:
+                                        await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                                    total_sent += 1
+                                except Exception as item_err:
+                                    logger.error(f"[Telegram upload error] Failed to deliver carousel item {c_idx * 10 + idx} ({ipath.name}): {item_err}")
                 else:
-                    media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
+                    # Single item chunk (e.g. 11th item)
+                    itype, ipath = chunk[0]
+                    item_cap = caption if (c_idx == 0 and total_sent == 0) else None
+                    mf = FSInputFile(ipath, chunk_size=524288)
+                    try:
+                        if itype == "photo":
+                            await message.reply_photo(photo=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                        else:
+                            await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                        total_sent += 1
+                    except Exception as item_err:
+                        logger.error(f"[Telegram upload error] Failed to deliver single carousel item ({ipath.name}): {item_err}")
 
-            logger.info(f"path: {result.carousel_files[0][1]}")
-            logger.info(f"exists: {result.carousel_files[0][1].exists()}")
-            logger.info(f"size: {sum(p.stat().st_size for _, p in result.carousel_files)} bytes total")
-            logger.info(f"mime/type: multipart/media-group")
-            logger.info("Telegram send started")
-
-            try:
-                sent_msgs = await message.reply_media_group(media=media_group, request_timeout=300)
-            except Exception as mg_err:
-                logger.warning(f"reply_media_group failed ({mg_err}), attempting answer_media_group")
-                try:
-                    sent_msgs = await message.answer_media_group(media=media_group, request_timeout=300)
-                except Exception as final_mg_err:
-                    logger.error(f"Telegram media group send failed: {final_mg_err}", exc_info=True)
-                    sent_msgs = None
-
-            if not sent_msgs:
-                logger.error("Failed to send carousel media group into Telegram.")
+            if total_sent == 0:
+                logger.error("Failed to send any carousel items into Telegram.")
                 job_queue.finish_job(req_id, success=False, error="Telegram send failed")
                 if status_msg:
                     await status_msg.edit_text("❌ Couldn't upload media to Telegram. Please try again.")
                 return
 
-            for idx in range(len(result.carousel_files)):
+            for idx in range(len(valid_files)):
                 logger.info(f"carousel item {idx} Telegram delivery success: True")
 
+            logger.info(f"Delivered {total_sent}/{len(valid_files)} carousel items to Telegram")
             logger.info("Telegram send completed")
             logger.info(f"TELEGRAM DELIVERY COMPLETE: {req_id}")
 
