@@ -32,6 +32,7 @@ from downloader import (
     download_media,
     extract_url,
     get_media_preview,
+    probe_media_streams,
 )
 from services import (
     IN_FLIGHT_DOWNLOADS,
@@ -227,13 +228,13 @@ async def _deliver_cached_media(
         ".jpg", ".jpeg", ".png", ".webp"
     )
 
-    audio_kb = None
-    if not is_photo:
-        audio_kb = InlineKeyboardBuilder()
-        audio_kb.button(
-            text="🎵 Audio",
-            callback_data=f"aud:{entry.platform[:8]}:{entry.media_id[:24]}:{entry.requested_quality[:6]}:{user_id}",
-        )
+    if not is_photo and file_path and file_path.exists():
+        has_v, has_a = probe_media_streams(file_path)
+        if has_a:
+            logger.info(f"AUDIO CHECK: video={has_v} audio=True")
+        else:
+            logger.info("AUDIO SOURCE: unavailable")
+            logger.info(f"AUDIO CHECK: video={has_v} audio=False")
 
     # Fast Path 1: Telegram file_id (instant 0.1s delivery)
     if entry.telegram_file_id:
@@ -252,7 +253,6 @@ async def _deliver_cached_media(
                     parse_mode="HTML",
                     duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                     supports_streaming=True,
-                    reply_markup=audio_kb.as_markup() if audio_kb else None,
                     request_timeout=60,
                 )
         except Exception as id_err:
@@ -287,7 +287,6 @@ async def _deliver_cached_media(
                         parse_mode="HTML",
                         duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                         supports_streaming=True,
-                        reply_markup=audio_kb.as_markup() if audio_kb else None,
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -299,7 +298,6 @@ async def _deliver_cached_media(
                             parse_mode="HTML",
                             duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                             supports_streaming=True,
-                            reply_markup=audio_kb.as_markup() if audio_kb else None,
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -309,7 +307,6 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup() if audio_kb else None,
                                 request_timeout=300,
                             )
                         except Exception:
@@ -317,7 +314,6 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup() if audio_kb else None,
                                 request_timeout=300,
                             )
 
@@ -546,6 +542,12 @@ async def _download_and_deliver(
                         if itype == "photo":
                             media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
                         else:
+                            has_v, has_a = probe_media_streams(ipath)
+                            if has_a:
+                                logger.info(f"AUDIO CHECK: video={has_v} audio=True")
+                            else:
+                                logger.info("AUDIO SOURCE: unavailable")
+                                logger.info(f"AUDIO CHECK: video={has_v} audio=False")
                             media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
 
                     try:
@@ -663,15 +665,18 @@ async def _download_and_deliver(
                             request_timeout=120,
                         )
             else:
+                # Validation before Telegram upload using ffprobe
+                has_v, has_a = probe_media_streams(upload_path)
+                if has_a:
+                    logger.info(f"AUDIO CHECK: video={has_v} audio=True")
+                else:
+                    logger.info("AUDIO SOURCE: unavailable")
+                    logger.info(f"AUDIO CHECK: video={has_v} audio=False")
+
                 v_duration = int(info.duration) if (info and info.duration and int(info.duration) > 0) else None
                 v_width = int(info.width) if (info and info.width and int(info.width) > 0) else None
                 v_height = int(info.height) if (info and info.height and int(info.height) > 0) else None
 
-                audio_kb = InlineKeyboardBuilder()
-                audio_kb.button(
-                    text="🎵 Audio",
-                    callback_data=f"aud:{platform_key[:8]}:{media_id[:24]}:{quality[:6]}:{user_id}",
-                )
                 try:
                     sent_msg = await message.reply_video(
                         video=media_file,
@@ -681,7 +686,6 @@ async def _download_and_deliver(
                         width=v_width,
                         height=v_height,
                         supports_streaming=True,
-                        reply_markup=audio_kb.as_markup(),
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -695,7 +699,6 @@ async def _download_and_deliver(
                             width=v_width,
                             height=v_height,
                             supports_streaming=True,
-                            reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -705,7 +708,6 @@ async def _download_and_deliver(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
                         except Exception:
@@ -714,7 +716,6 @@ async def _download_and_deliver(
                                     document=media_file,
                                     caption=caption,
                                     parse_mode="HTML",
-                                    reply_markup=audio_kb.as_markup(),
                                     request_timeout=300,
                                 )
                             except Exception as doc_err:

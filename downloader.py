@@ -450,22 +450,23 @@ def _build_format_options(
     plat_key = getattr(platform_info, "key", "").lower()
 
     # Instagram & Facebook: Highest available quality
-    # Prioritize progressive streams with audio, or merge with AAC audio
+    # Guarantee bestvideo+bestaudio is selected whenever separate streams exist,
+    # and require progressive streams with audio before falling back to video-only
     if plat_key in ("instagram", "facebook"):
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
-                "best[ext=mp4][acodec!=none]/"
-                "best[acodec!=none]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/"
+                "best[vcodec!=none][acodec!=none]/"
+                "best[acodec!=none]/"
+                "best[vcodec!=none]/"
                 "best"
             )
         else:
             format_spec = (
-                "best[ext=mp4][acodec!=none]/"
+                "best[vcodec!=none][acodec!=none]/"
                 "best[acodec!=none]/"
+                "best[vcodec!=none]/"
                 "best"
             )
         return format_spec, postprocessors, merge_output_format
@@ -477,25 +478,25 @@ def _build_format_options(
             merge_output_format = "mp4"
             format_spec = (
                 "22/18/"
-                "best[height<=1080][ext=mp4][acodec!=none]/"
-                "best[height<=1080][acodec!=none]/"
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=1080]+bestaudio[ext=m4a]/"
                 "bestvideo[height<=1080]+bestaudio/"
                 "bestvideo+bestaudio/"
-                "best[height<=720][ext=mp4][acodec!=none]/"
-                "best[height<=720][acodec!=none]/"
+                "best[height<=1080][vcodec!=none][acodec!=none]/"
+                "best[height<=1080][acodec!=none]/"
+                "best[vcodec!=none][acodec!=none]/"
                 "best[acodec!=none]/"
+                "best[height<=1080][vcodec!=none]/"
+                "best[vcodec!=none]/"
                 "best"
             )
         else:
             format_spec = (
                 "22/18/"
-                "best[height<=1080][ext=mp4][acodec!=none]/"
+                "best[height<=1080][vcodec!=none][acodec!=none]/"
                 "best[height<=1080][acodec!=none]/"
-                "best[height<=720][ext=mp4][acodec!=none]/"
-                "best[height<=720][acodec!=none]/"
+                "best[vcodec!=none][acodec!=none]/"
                 "best[acodec!=none]/"
+                "best[height<=1080][vcodec!=none]/"
+                "best[vcodec!=none]/"
                 "best"
             )
         return format_spec, postprocessors, merge_output_format
@@ -510,54 +511,63 @@ def _build_format_options(
             merge_output_format = "mp4"
             format_spec = (
                 "22/18/"
-                f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[height<={h_val}][ext=mp4][acodec!=none]/"
-                f"best[height<={h_val}][acodec!=none]/"
-                f"bestvideo[height<={h_val}][height>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[width<={h_val}][width>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={h_val}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h_val}][height>{h_min}]+bestaudio/"
+                f"bestvideo[width<={h_val}][width>{h_min}]+bestaudio/"
                 f"bestvideo[height<={h_val}]+bestaudio/"
+                f"bestvideo+bestaudio/"
+                f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
+                f"best[height<={h_val}][acodec!=none]/"
+                f"best[vcodec!=none][acodec!=none]/"
                 f"best[acodec!=none]/"
-                f"best"
+                f"best[height<={h_val}][vcodec!=none]/"
+                f"best[vcodec!=none]/"
+                "best"
             )
         else:
             format_spec = (
                 "22/18/"
-                f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
+                f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][acodec!=none]/"
-                f"best[width<={h_val}][acodec!=none]/"
+                f"best[vcodec!=none][acodec!=none]/"
                 f"best[acodec!=none]/"
-                f"best"
+                f"best[height<={h_val}][vcodec!=none]/"
+                f"best[vcodec!=none]/"
+                "best"
             )
     else:
         # For 1080p+ separate streams are necessary to achieve 1080p/2K/4K resolution
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
-                f"bestvideo[height<={h_val}][height>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[width<={h_val}][width>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={h_val}][height>{h_min}]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={h_val}][height>{h_min}]+bestaudio/"
-                f"bestvideo[height<={h_val}]+bestaudio[ext=m4a]/"
+                f"bestvideo[width<={h_val}][width>{h_min}]+bestaudio/"
                 f"bestvideo[height<={h_val}]+bestaudio/"
                 f"bestvideo+bestaudio/"
-                f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[height<={h_val}][ext=mp4][acodec!=none]/"
+                f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][acodec!=none]/"
+                f"best[vcodec!=none][acodec!=none]/"
                 f"best[acodec!=none]/"
-                f"best"
+                f"best[height<={h_val}][vcodec!=none]/"
+                f"best[vcodec!=none]/"
+                "best"
             )
         else:
             format_spec = (
-                f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
-                f"best[height<={h_val}][ext=mp4][acodec!=none]/"
+                f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
+                f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][acodec!=none]/"
+                f"best[vcodec!=none][acodec!=none]/"
                 f"best[acodec!=none]/"
-                f"best"
+                f"best[height<={h_val}][vcodec!=none]/"
+                f"best[vcodec!=none]/"
+                "best"
             )
 
     return format_spec, postprocessors, merge_output_format
@@ -1300,7 +1310,39 @@ def _sync_download(
                 try:
                     item_file = temp_dir / f"carousel_{idx}_{iid}.mp4"
                     downloaded_ok = False
-                    if iurl and ("fbcdn.net" in iurl or "cdninstagram.com" in iurl or ".mp4" in iurl):
+                    raw_entry = it.get("raw_entry")
+                    entry_fmts = (raw_entry.get("formats") if raw_entry else None) or []
+                    entry_has_audio = any(_has_audio_in_format(f) for f in entry_fmts)
+                    if not entry_has_audio and raw_entry and raw_entry.get("acodec") not in (None, "none"):
+                        entry_has_audio = True
+
+                    # If the entry has formats with separate or merged audio, use yt-dlp to process and merge
+                    if raw_entry and entry_has_audio and ffmpeg_bin:
+                        try:
+                            v_ydl_opts = {
+                                "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best[vcodec!=none]/best",
+                                "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
+                                "merge_output_format": "mp4",
+                                "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
+                                "ffmpeg_location": str(Path(ffmpeg_bin).parent),
+                                "quiet": True,
+                                "no_warnings": True,
+                                "socket_timeout": 20,
+                                "http_headers": DEFAULT_HTTP_HEADERS,
+                            }
+                            cleaned_entry = copy.deepcopy(raw_entry)
+                            for k in ("requested_formats", "requested_subtitles", "format", "format_id", "format_note"):
+                                cleaned_entry.pop(k, None)
+                            with yt_dlp.YoutubeDL(v_ydl_opts) as ydl_item:
+                                ydl_item.process_ie_result(cleaned_entry, download=True)
+                            found_v = [f for f in temp_dir.glob(f"carousel_{idx}_*") if f.is_file() and not f.name.endswith((".part", ".ytdl"))]
+                            if found_v and found_v[0].stat().st_size > 0:
+                                item_file = found_v[0]
+                                downloaded_ok = True
+                        except Exception as proc_e:
+                            logger.debug(f"process_ie_result failed for carousel video {idx}: {proc_e}")
+
+                    if not downloaded_ok and iurl and ("fbcdn.net" in iurl or "cdninstagram.com" in iurl or ".mp4" in iurl):
                         try:
                             req = urllib.request.Request(iurl, headers=DEFAULT_HTTP_HEADERS)
                             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1314,7 +1356,7 @@ def _sync_download(
 
                     if not downloaded_ok:
                         v_ydl_opts = {
-                            "format": "best[ext=mp4][acodec!=none]/best[acodec!=none]/bestvideo+bestaudio/best",
+                            "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best[vcodec!=none]/best",
                             "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
                             "merge_output_format": "mp4",
                             "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
@@ -1334,9 +1376,53 @@ def _sync_download(
 
                     if downloaded_ok and item_file.exists() and item_file.stat().st_size > 0:
                         has_v, has_a = probe_media_streams(item_file)
+
+                        # Emergency audio merge for carousel video if audio is missing
+                        if not has_a and entry_has_audio and ffmpeg_bin:
+                            logger.warning(f"Audio missing in carousel video {idx}, attempting emergency audio merge...")
+                            try:
+                                audio_fmts = [f for f in entry_fmts if _has_audio_in_format(f) and f.get("vcodec") == "none"]
+                                if not audio_fmts:
+                                    audio_fmts = [f for f in entry_fmts if _has_audio_in_format(f)]
+                                if audio_fmts:
+                                    best_a = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+                                    a_url = best_a.get("url")
+                                    if a_url:
+                                        audio_file = temp_dir / f"carousel_{idx}_audio_{uuid.uuid4().hex[:6]}.m4a"
+                                        req = urllib.request.Request(a_url, headers=DEFAULT_HTTP_HEADERS)
+                                        with urllib.request.urlopen(req, timeout=30) as resp:
+                                            with open(audio_file, "wb") as af:
+                                                while chunk := resp.read(1024 * 512):
+                                                    af.write(chunk)
+                                        if audio_file.exists() and audio_file.stat().st_size > 0:
+                                            merged_file = temp_dir / f"carousel_{idx}_merged_{uuid.uuid4().hex[:6]}.mp4"
+                                            cmd = [
+                                                ffmpeg_bin, "-y",
+                                                "-i", str(item_file),
+                                                "-i", str(audio_file),
+                                                "-map", "0:v:0",
+                                                "-map", "1:a:0",
+                                                "-c:v", "copy",
+                                                "-c:a", "aac",
+                                                "-b:a", "192k",
+                                                "-movflags", "+faststart",
+                                                str(merged_file),
+                                            ]
+                                            merge_res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                                            if merge_res.returncode == 0 and merged_file.exists() and merged_file.stat().st_size > 0:
+                                                item_file = merged_file
+                                                has_v, has_a = probe_media_streams(item_file)
+                            except Exception as m_err:
+                                logger.error(f"Carousel emergency audio merge failed: {m_err}", exc_info=True)
+
                         logger.info("carousel item download success: True")
                         logger.info(f"carousel item video stream: {'YES' if has_v else 'NO'}")
                         logger.info(f"carousel item audio stream: {'YES' if has_a else 'NO'}")
+                        if not entry_has_audio and not has_a:
+                            logger.info("AUDIO SOURCE: unavailable")
+                            logger.info(f"AUDIO CHECK: video={has_v} audio=False")
+                        else:
+                            logger.info(f"AUDIO CHECK: video={has_v} audio={has_a}")
                         logger.info(f"carousel item local path: {item_file}")
                         carousel_files.append(("video", item_file))
                     else:
@@ -1769,8 +1855,57 @@ def _sync_download(
             logger.info(f"file size: {file_size}")
             logger.info(f"correct media extension: {ext in ('.mp4', '.mkv', '.webm', '.mov', '.m4a', '.mp3')}")
 
+            source_fmts = info_dict.get("formats") or []
+            source_has_audio = any(_has_audio_in_format(f) for f in source_fmts)
+            if not source_has_audio and info_dict.get("acodec") not in (None, "none"):
+                source_has_audio = True
+
             # Probe media streams to verify sound/video presence
             has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+
+            # Emergency fallback merge if audio was available at source but missing in downloaded file
+            if not has_a_stream and source_has_audio and ffmpeg_bin:
+                logger.warning(
+                    f"Audio missing in downloaded file {downloaded_file.name} despite source having audio! "
+                    "Attempting emergency audio extraction and merge..."
+                )
+                try:
+                    audio_fmts = [f for f in source_fmts if _has_audio_in_format(f) and f.get("vcodec") == "none"]
+                    if not audio_fmts:
+                        audio_fmts = [f for f in source_fmts if _has_audio_in_format(f)]
+                    if audio_fmts:
+                        best_a = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+                        a_url = best_a.get("url")
+                        if a_url:
+                            audio_tmp = temp_dir / f"emergency_audio_{uuid.uuid4().hex[:6]}.m4a"
+                            req = urllib.request.Request(a_url, headers=DEFAULT_HTTP_HEADERS)
+                            with urllib.request.urlopen(req, timeout=30) as resp:
+                                with open(audio_tmp, "wb") as af:
+                                    while chunk := resp.read(1024 * 512):
+                                        af.write(chunk)
+                            if audio_tmp.exists() and audio_tmp.stat().st_size > 0:
+                                merged_tmp = temp_dir / f"emergency_merged_{uuid.uuid4().hex[:6]}.mp4"
+                                cmd = [
+                                    ffmpeg_bin, "-y",
+                                    "-i", str(downloaded_file),
+                                    "-i", str(audio_tmp),
+                                    "-map", "0:v:0",
+                                    "-map", "1:a:0",
+                                    "-c:v", "copy",
+                                    "-c:a", "aac",
+                                    "-b:a", "192k",
+                                    "-movflags", "+faststart",
+                                    str(merged_tmp),
+                                ]
+                                m_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                                if m_proc.returncode == 0 and merged_tmp.exists() and merged_tmp.stat().st_size > 0:
+                                    downloaded_file = merged_tmp
+                                    file_size = downloaded_file.stat().st_size
+                                    ext = downloaded_file.suffix.lower()
+                                    has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+                except Exception as emerg_err:
+                    logger.error(f"Emergency audio merge failed: {emerg_err}", exc_info=True)
+
             logger.info(
                 f"[VIDEO VERIFICATION] file={downloaded_file.name}, size={file_size}, "
                 f"has_video={has_v_stream}, has_audio={has_a_stream}, ext={ext}"
@@ -1780,6 +1915,13 @@ def _sync_download(
                 f"Formats: {len(info_dict.get('formats') or [])} | SelectedFormat: {info_dict.get('format_id')} | "
                 f"VideoStream: {has_v_stream} | AudioStream: {has_a_stream} | Error: None"
             )
+
+            # Strict logging per Requirement 11 & 12
+            if not source_has_audio and not has_a_stream:
+                logger.info("AUDIO SOURCE: unavailable")
+                logger.info(f"AUDIO CHECK: video={has_v_stream} audio=False")
+            else:
+                logger.info(f"AUDIO CHECK: video={has_v_stream} audio={has_a_stream}")
 
             if platform_info.key == "instagram":
                 logger.info(f"[IG DEBUG] URL={url}")
