@@ -562,8 +562,9 @@ def _build_format_options(
 
 def _extract_instagram_embed_fallback(url: str) -> Optional[dict]:
     """
-    Extracts high-resolution photo URL and caption from Instagram embed HTML
-    when yt-dlp refuses single photo posts with 'There is no video in this post'.
+    Extracts high-resolution media (video or photo) and caption from Instagram embed HTML
+    when yt-dlp refuses single photo posts or encounters transient API format mismatches.
+    Respects private and login-required restrictions without bypassing them.
     """
     shortcode_match = re.search(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
     if not shortcode_match:
@@ -571,20 +572,66 @@ def _extract_instagram_embed_fallback(url: str) -> Optional[dict]:
     shortcode = shortcode_match.group(1)
     embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": DEFAULT_HTTP_HEADERS["User-Agent"],
         "Accept-Language": "en-US,en;q=0.9",
     }
     req = urllib.request.Request(embed_url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
-            m = re.search(r'<img[^>]*class="EmbeddedMediaImage"[^>]*src="([^"]+)"', body)
-            if not m:
-                m = re.search(r'<img[^>]*src="([^"]+)"[^>]*class="EmbeddedMediaImage"', body)
+            body_lower = body.lower()
 
+            # Respect Instagram platform restrictions without bypassing them
+            if any(k in body_lower for k in ("this account is private", "private account", "only approved followers")):
+                logger.info(f"Instagram embed confirms private account for {shortcode}")
+                raise yt_dlp.utils.ExtractorError(
+                    "This Instagram account is private. Content is only visible to approved followers.",
+                    expected=True,
+                )
+            if any(k in body_lower for k in ("please log in", "login required", "checkpoint_required", "redirected to login")):
+                logger.info(f"Instagram embed confirms login required for {shortcode}")
+                raise yt_dlp.utils.ExtractorError(
+                    "Instagram requires authentication to access this content (Login Required).",
+                    expected=True,
+                )
+            if any(k in body_lower for k in ("age-restricted", "sensitive content", "viewer discretion", "must be 18")):
+                logger.info(f"Instagram embed confirms sensitive/age barrier for {shortcode}")
+                raise yt_dlp.utils.ExtractorError(
+                    "Instagram restricted this post behind an age/sensitivity verification barrier.",
+                    expected=True,
+                )
+            if any(k in body_lower for k in ("content isn't available", "link you followed may be broken", "page not found")):
+                logger.info(f"Instagram embed confirms post unavailable/deleted for {shortcode}")
+                raise yt_dlp.utils.ExtractorError(
+                    "This post does not exist or has been deleted by the owner.",
+                    expected=True,
+                )
+
+            # 1. Check for Video
+            video_url = None
+            m_vid = re.search(r'<video[^>]*class="EmbeddedMediaVideo"[^>]*src="([^"]+)"', body)
+            if not m_vid:
+                m_vid = re.search(r'<video[^>]*src="([^"]+)"', body)
+            if m_vid:
+                video_url = html.unescape(m_vid.group(1)).replace("&amp;", "&")
+            else:
+                for match in re.findall(r'"video_url"\s*:\s*"([^"]+)"', body):
+                    try:
+                        cand = html.unescape(match.encode().decode('unicode-escape', errors='ignore')).replace("&amp;", "&")
+                        if "cdninstagram" in cand or "fbcdn" in cand:
+                            video_url = cand
+                            break
+                    except Exception:
+                        pass
+
+            # 2. Check for Photo / Thumbnail
             photo_url = None
-            if m:
-                photo_url = html.unescape(m.group(1)).replace("&amp;", "&")
+            m_img = re.search(r'<img[^>]*class="EmbeddedMediaImage"[^>]*src="([^"]+)"', body)
+            if not m_img:
+                m_img = re.search(r'<img[^>]*src="([^"]+)"[^>]*class="EmbeddedMediaImage"', body)
+
+            if m_img:
+                photo_url = html.unescape(m_img.group(1)).replace("&amp;", "&")
             else:
                 for match in re.findall(r'https://[^"\'<>\s]+', body):
                     cand = html.unescape(match).replace("&amp;", "&")
@@ -593,7 +640,7 @@ def _extract_instagram_embed_fallback(url: str) -> Optional[dict]:
                             photo_url = cand
                             break
 
-            if not photo_url:
+            if not video_url and not photo_url:
                 return None
 
             author = "Instagram Creator"
@@ -607,23 +654,127 @@ def _extract_instagram_embed_fallback(url: str) -> Optional[dict]:
                 raw_c = re.sub(r"<[^>]+>", " ", cap_m.group(1))
                 caption = html.unescape(raw_c).strip()
 
-            title = caption[:80] if caption else f"Instagram Photo by {author}"
+            title = caption[:80] if caption else f"Instagram Media by {author}"
 
-            return {
-                "id": shortcode,
-                "title": title,
-                "uploader": author,
-                "thumbnails": [{"url": photo_url}],
-                "thumbnail": photo_url,
-                "url": photo_url,
-                "ext": "jpg",
-                "media_type": "photo",
-                "is_carousel": False,
-                "carousel_items": [],
-            }
-    except Exception as e:
-        logger.warning(f"Instagram embed photo fallback error for {url}: {e}")
+            if video_url:
+                return {
+                    "id": shortcode,
+                    "title": title,
+                    "uploader": author,
+                    "url": video_url,
+                    "formats": [{
+                        "url": video_url,
+                        "ext": "mp4",
+                        "format_id": "embed_video",
+                        "vcodec": "h264",
+                        "acodec": "aac",
+                    }],
+                    "thumbnail": photo_url,
+                    "thumbnails": [{"url": photo_url}] if photo_url else [],
+                    "ext": "mp4",
+                    "media_type": "video",
+                    "is_carousel": False,
+                    "carousel_items": [],
+                    "extractor": "generic",
+                    "extractor_key": "Generic",
+                }
+            else:
+                return {
+                    "id": shortcode,
+                    "title": title,
+                    "uploader": author,
+                    "thumbnails": [{"url": photo_url}],
+                    "thumbnail": photo_url,
+                    "url": photo_url,
+                    "ext": "jpg",
+                    "media_type": "photo",
+                    "is_carousel": False,
+                    "carousel_items": [],
+                    "extractor": "generic",
+                    "extractor_key": "Generic",
+                }
+    except urllib.error.HTTPError as http_err:
+        if http_err.code == 404:
+            raise yt_dlp.utils.ExtractorError(
+                "This post does not exist or has been deleted by the owner.",
+                expected=True,
+            )
+        elif http_err.code == 429:
+            raise yt_dlp.utils.ExtractorError(
+                "Instagram is temporarily limiting requests (429 Too Many Requests).",
+                expected=True,
+            )
+        elif http_err.code in (401, 403):
+            raise yt_dlp.utils.ExtractorError(
+                "Instagram requires authentication to access this content.",
+                expected=True,
+            )
+        logger.warning(f"Instagram embed HTTP error for {url}: {http_err}")
         return None
+    except yt_dlp.utils.ExtractorError:
+        raise
+    except Exception as e:
+        logger.warning(f"Instagram embed fallback error for {url}: {e}")
+        return None
+
+
+
+def format_extraction_error(error: Any, url: str = "") -> str:
+    """
+    Translates extraction/download exceptions into precise, transparent technical reasons
+    (Private account, Login requirement, Age/Sensitive content barrier, Deleted/Unavailable,
+    Geographic restriction, Rate-limiting, or exact underlying platform error)
+    instead of opaque or generic rejection messages.
+    """
+    err_str = str(error).strip()
+    err_lower = err_str.lower()
+
+    # 1. Private Account (Do not bypass)
+    if any(k in err_lower for k in ("this account is private", "private account", "only approved followers")):
+        return "🔒 Private Account: This Instagram account is private. Content is only visible to approved followers."
+
+    # 2. Login Requirement (Do not bypass)
+    if any(k in err_lower for k in ("login required", "please log in", "checkpoint_required", "redirected to login", "sign in to view")):
+        return "🔒 Login Required: Instagram requires authentication to access this content."
+
+    # 3. Age / Sensitive Content Access Controls (Do not bypass)
+    if any(k in err_lower for k in ("age-restricted", "age restricted", "sensitive content", "viewer discretion", "must be 18")):
+        return "🔞 Age / Sensitive Content: Instagram has restricted this post behind an age/sensitivity verification barrier."
+
+    # 4. Deleted or Unavailable Content
+    if any(k in err_lower for k in ("not found", "deleted", "unavailable", "404", "this content isn't available")):
+        return "🚫 Post Unavailable: This post does not exist or has been deleted by the owner."
+
+    # 5. Geographic / Region Restriction
+    if any(k in err_lower for k in ("geo-restricted", "geoblocked", "not available in your region", "not available in your country")):
+        return "🌍 Region Restricted: This Instagram media is restricted in the server's geographic location."
+
+    # 6. Rate Limited / Temporary Block
+    if any(k in err_lower for k in ("429", "too many requests", "rate limit", "temporarily blocked")):
+        return "⏳ Rate Limited: Instagram is temporarily limiting requests. Please wait a minute and retry."
+
+    # 7. Empty Media Response
+    if "empty media response" in err_lower:
+        return "⚠️ Empty Media: Instagram returned an empty response (post may be restricted, expired, or unavailable)."
+
+    # 8. File Size Limit
+    if "too large" in err_lower or "max_filesize" in err_lower:
+        return "⚠️ File Size Limit: Media exceeds Telegram's file size limit (50 MB)."
+
+    # 9. Unsupported URL
+    if "unsupported url" in err_lower:
+        return "❌ Unsupported Link: This URL format is not supported."
+
+    # 10. Clean and expose underlying technical error
+    clean_msg = re.sub(r"^ERROR:\s*\[[^\]]+\]\s*[^:]*:\s*", "", err_str, flags=re.IGNORECASE).strip()
+    if clean_msg:
+        first_line = clean_msg.split("\n")[0].strip()
+        if len(first_line) > 140:
+            first_line = first_line[:137] + "…"
+        return f"❌ Technical Reason: {first_line}"
+
+    return "❌ Media extraction failed. Please check if the link is accessible."
+
 
 
 def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional[str]]:
@@ -676,11 +827,20 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
                             raise raw_err
                     if not info and platform_info.key == "instagram":
                         info = _extract_instagram_embed_fallback(url)
+                elif platform_info.key == "instagram" and any(k in err_lower for k in ("empty media response", "unable to extract", "no video formats", "format is not available")):
+                    info = _extract_instagram_embed_fallback(url)
+                    if not info:
+                        raise dl_err
                 else:
                     raise dl_err
 
+        if not info and platform_info.key == "instagram":
+            info = _extract_instagram_embed_fallback(url)
+
         if not info:
-            return False, None, "❌ Couldn't inspect this media link."
+            if platform_info.key == "instagram":
+                return False, None, "⚠️ Empty Media: Instagram returned an empty response (post may be restricted, expired, or unavailable)."
+            return False, None, "❌ Media extraction failed. Platform returned no data."
 
         # Detect Carousel vs Single Photo vs Video
         is_carousel = False
@@ -788,19 +948,11 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         return True, media_info, None
 
     except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)
-        err_lower = err_msg.lower()
-        logger.error(f"Preview extraction DownloadError for {url}: {err_msg}", exc_info=True)
-        if "empty media response" in err_lower or "sign in" in err_lower or "login" in err_lower or "bot" in err_lower or "restricted" in err_lower:
-            return False, None, "🔒 This content requires login, is private, or restricted."
-        if "unavailable" in err_lower or "not found" in err_lower or "deleted" in err_lower:
-            return False, None, "🚫 This media is unavailable or has been deleted."
-        if "unsupported url" in err_lower:
-            return False, None, "❌ This platform or link is not supported."
-        return False, None, "❌ Couldn't inspect this media link."
+        logger.error(f"Preview extraction DownloadError for {url}: {e}", exc_info=True)
+        return False, None, format_extraction_error(e, url)
     except Exception as e:
         logger.error(f"Unexpected preview error for {url}: {e}", exc_info=True)
-        return False, None, "❌ Error inspecting media link."
+        return False, None, format_extraction_error(e, url)
 
 
 async def get_media_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional[str]]:
@@ -1236,12 +1388,15 @@ def _sync_download(
             if not info_dict:
                 info_dict = ydl.extract_info(url, download=True)
 
+            if not info_dict and platform_info.key == "instagram":
+                info_dict = _extract_instagram_embed_fallback(url)
+
             if not info_dict:
                 record_download_finish(success=False)
                 return DownloadResult(
                     success=False,
                     error_code="DOWNLOAD_FAILED",
-                    error_message="❌ Couldn't download this media link.",
+                    error_message="⚠️ Empty Media: Platform returned no downloadable media for this link.",
                     temp_dir=temp_dir,
                 )
 
@@ -1480,14 +1635,29 @@ def _sync_download(
                         extraction_time_s=p_info.extraction_time_s,
                     )
 
-        if "sign in" in err_str or "login" in err_str or "restricted" in err_str or "empty media response" in err_str:
-            msg = "🔒 This content requires login, is private, or restricted."
-        elif "unavailable" in err_str or "deleted" in err_str:
-            msg = "🚫 Media is unavailable or deleted."
-        elif "too large" in err_str:
-            msg = "⚠️ Media exceeds the file size limit."
-        else:
-            msg = "❌ Couldn't download this media link."
+        # Instagram embed fallback if download failed with empty media or unable to extract
+        if platform_info.key == "instagram" and any(k in err_str for k in ("empty media response", "unable to extract", "no video formats")):
+            try:
+                fb_info = _extract_instagram_embed_fallback(url)
+                if fb_info:
+                    return _sync_download(
+                        url=url,
+                        user_id=user_id,
+                        quality="photo" if fb_info.get("media_type") == "photo" else quality,
+                        req_id=req_id,
+                        progress_callback=progress_callback,
+                        cached_info=fb_info,
+                    )
+            except Exception as fb_err:
+                msg = format_extraction_error(fb_err, url)
+                return DownloadResult(
+                    success=False,
+                    error_code="DOWNLOAD_ERROR",
+                    error_message=msg,
+                    temp_dir=temp_dir,
+                )
+
+        msg = format_extraction_error(e, url)
         return DownloadResult(
             success=False,
             error_code="DOWNLOAD_ERROR",
@@ -1501,7 +1671,7 @@ def _sync_download(
         return DownloadResult(
             success=False,
             error_code="UNKNOWN_ERROR",
-            error_message="❌ An unexpected error occurred.",
+            error_message=format_extraction_error(e, url),
             temp_dir=temp_dir,
         )
     finally:
