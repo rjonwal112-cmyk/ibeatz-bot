@@ -206,12 +206,24 @@ async def admin_maintenance_handler(message: Message) -> None:
     """Toggles bot maintenance mode persistently."""
     user_id = message.from_user.id if message.from_user else 0
     if not is_admin(user_id):
+        await message.reply("⛔ This command is restricted to bot administrators.")
         return
 
-    current = is_maintenance_mode()
-    await set_maintenance_mode(not current)
-    new_state = not current
-    state_str = "🔴 ENABLED (Bot is paused for users)" if new_state else "🟢 DISABLED (Bot is normal)"
+    text = (message.text or "").strip().lower()
+    parts = text.split()
+    if len(parts) > 1:
+        arg = parts[1]
+        if arg in ("off", "disable", "stop", "0", "false"):
+            new_state = False
+        elif arg in ("on", "enable", "start", "1", "true"):
+            new_state = True
+        else:
+            new_state = not is_maintenance_mode()
+    else:
+        new_state = not is_maintenance_mode()
+
+    await set_maintenance_mode(new_state)
+    state_str = "🔴 ENABLED (Bot is paused for users)" if new_state else "🟢 DISABLED (Bot is normal operational)"
     logger.info(f"Maintenance mode set to {new_state} by admin {user_id}")
     await message.answer(f"🛠 <b>Maintenance Mode:</b> {state_str}")
 

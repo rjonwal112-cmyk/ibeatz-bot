@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import mimetypes
 import time
@@ -59,6 +60,19 @@ USER_LAST_REQUEST_TIME: dict[int, float] = {}
 
 # Pending requests metadata storage: req_id -> dict
 PENDING_REQUESTS: dict[str, dict] = {}
+
+
+def build_media_caption(source_url: str) -> str:
+    if not source_url:
+        return ""
+
+    safe_url = html.escape(source_url, quote=True)
+
+    return (
+        '<a href="https://t.me/ibeatzfetch_bot">ɪʙᴇᴀᴛᴢ ғᴇᴛᴄʜ</a>'
+        ' | '
+        f'<a href="{safe_url}">Source</a>'
+    )
 
 
 def clean_and_validate_media_url(raw_url: str) -> Optional[str]:
@@ -188,6 +202,7 @@ async def _deliver_cached_media(
     user_mention: str,
     is_group: bool,
     t_start: float = 0.0,
+    original_url: Optional[str] = None,
 ) -> bool:
     """
     Delivers media directly from persistent cache.
@@ -201,13 +216,8 @@ async def _deliver_cached_media(
     if not entry.telegram_file_id and not has_local_file:
         return False
 
-    short_title = (entry.title[:50] + "...") if len(entry.title) > 55 else entry.title
-    quality_label = QUALITY_LABELS.get(entry.requested_quality, entry.requested_quality)
-
-    if is_group:
-        caption = f"👤 {user_mention}\n{short_title}\nQuality: {quality_label}"
-    else:
-        caption = f"{short_title}\nQuality: {quality_label}"
+    source_url = entry.normalized_url or original_url or ""
+    caption = build_media_caption(source_url)
 
     # Post-delivery Audio button
     audio_kb = InlineKeyboardBuilder()
@@ -230,12 +240,14 @@ async def _deliver_cached_media(
                 sent_msg = await message.reply_photo(
                     photo=entry.telegram_file_id,
                     caption=caption,
+                    parse_mode="HTML",
                     request_timeout=60,
                 )
             else:
                 sent_msg = await message.reply_video(
                     video=entry.telegram_file_id,
                     caption=caption,
+                    parse_mode="HTML",
                     duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                     supports_streaming=True,
                     reply_markup=audio_kb.as_markup(),
@@ -255,12 +267,14 @@ async def _deliver_cached_media(
                     sent_msg = await message.reply_photo(
                         photo=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         request_timeout=120,
                     )
                 except Exception:
                     sent_msg = await message.answer_photo(
                         photo=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         request_timeout=120,
                     )
             else:
@@ -268,6 +282,7 @@ async def _deliver_cached_media(
                     sent_msg = await message.reply_video(
                         video=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                         supports_streaming=True,
                         reply_markup=audio_kb.as_markup(),
@@ -279,6 +294,7 @@ async def _deliver_cached_media(
                         sent_msg = await message.answer_video(
                             video=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                             supports_streaming=True,
                             reply_markup=audio_kb.as_markup(),
@@ -290,6 +306,7 @@ async def _deliver_cached_media(
                             sent_msg = await message.reply_document(
                                 document=media_file,
                                 caption=caption,
+                                parse_mode="HTML",
                                 reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
@@ -297,6 +314,7 @@ async def _deliver_cached_media(
                             sent_msg = await message.answer_document(
                                 document=media_file,
                                 caption=caption,
+                                parse_mode="HTML",
                                 reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
@@ -306,6 +324,7 @@ async def _deliver_cached_media(
                         sent_msg = await message.reply_document(
                             document=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
@@ -313,6 +332,7 @@ async def _deliver_cached_media(
                         sent_msg = await message.answer_document(
                             document=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
@@ -405,12 +425,39 @@ async def _download_and_deliver(
         url=url,
         quality=quality,
     )
-    job_queue.update_status(req_id, JobStatus.DOWNLOADING)
 
     async with IN_FLIGHT_LOCK:
         if flight_key not in IN_FLIGHT_DOWNLOADS:
             flight_future = loop.create_future()
             IN_FLIGHT_DOWNLOADS[flight_key] = flight_future
+
+    async def _on_queued(pos: int) -> None:
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ In queue (Position #{pos})… Waiting for available slot.",
+                    reply_markup=cancel_kb if not is_group else None,
+                )
+            except Exception:
+                pass
+
+    acquired = await job_queue.acquire_slot(job_id=req_id, on_queued=_on_queued)
+    if not acquired:
+        logger.info(f"🔴 [QUEUE] Job {req_id} cancelled or aborted while queued/waiting.")
+        async with IN_FLIGHT_LOCK:
+            if flight_future and not flight_future.done():
+                flight_future.set_result(None)
+            IN_FLIGHT_DOWNLOADS.pop(flight_key, None)
+        return
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(
+                "⬇️ Downloading…",
+                reply_markup=cancel_kb if not is_group else None,
+            )
+        except Exception:
+            pass
 
     last_update_time = [0.0]
 
@@ -476,13 +523,8 @@ async def _download_and_deliver(
 
         info = result.media_info
         raw_title = (info.title if info else None) or (result.file_path.stem if result.file_path else "Media")
-        short_title = (raw_title[:50] + "...") if len(raw_title) > 55 else raw_title
-        quality_label = QUALITY_LABELS.get(quality, quality)
-
-        if is_group:
-            caption = f"👤 {user_mention}\n{short_title}\nQuality: {quality_label}"
-        else:
-            caption = f"{short_title}\nQuality: {quality_label}"
+        source_url = url or ""
+        caption = build_media_caption(source_url)
 
         audio_kb = InlineKeyboardBuilder()
         audio_kb.button(
@@ -509,9 +551,9 @@ async def _download_and_deliver(
             for idx, (itype, ipath) in enumerate(result.carousel_files):
                 item_cap = caption if idx == 0 else None
                 if itype == "photo":
-                    media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap))
+                    media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
                 else:
-                    media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap))
+                    media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
 
             logger.info(f"path: {result.carousel_files[0][1]}")
             logger.info(f"exists: {result.carousel_files[0][1].exists()}")
@@ -565,6 +607,7 @@ async def _download_and_deliver(
                     sent_msg = await message.reply_audio(
                         audio=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         duration=int(info.duration) if (info and info.duration and int(info.duration) > 0) else None,
                         performer=info.uploader if info else "",
                         title=raw_title,
@@ -575,6 +618,7 @@ async def _download_and_deliver(
                     sent_msg = await message.answer_audio(
                         audio=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         duration=int(info.duration) if (info and info.duration and int(info.duration) > 0) else None,
                         performer=info.uploader if info else "",
                         title=raw_title,
@@ -585,6 +629,7 @@ async def _download_and_deliver(
                     sent_msg = await message.reply_photo(
                         photo=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         request_timeout=120,
                     )
                 except Exception as photo_err:
@@ -593,12 +638,14 @@ async def _download_and_deliver(
                         sent_msg = await message.answer_photo(
                             photo=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             request_timeout=120,
                         )
                     except Exception:
                         sent_msg = await message.reply_document(
                             document=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             request_timeout=120,
                         )
             else:
@@ -609,6 +656,7 @@ async def _download_and_deliver(
                     sent_msg = await message.reply_video(
                         video=media_file,
                         caption=caption,
+                        parse_mode="HTML",
                         duration=v_duration,
                         width=v_width,
                         height=v_height,
@@ -622,6 +670,7 @@ async def _download_and_deliver(
                         sent_msg = await message.answer_video(
                             video=media_file,
                             caption=caption,
+                            parse_mode="HTML",
                             duration=v_duration,
                             width=v_width,
                             height=v_height,
@@ -635,6 +684,7 @@ async def _download_and_deliver(
                             sent_msg = await message.reply_document(
                                 document=media_file,
                                 caption=caption,
+                                parse_mode="HTML",
                                 reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
@@ -643,6 +693,7 @@ async def _download_and_deliver(
                                 sent_msg = await message.answer_document(
                                     document=media_file,
                                     caption=caption,
+                                    parse_mode="HTML",
                                     reply_markup=audio_kb.as_markup(),
                                     request_timeout=300,
                                 )
@@ -746,6 +797,7 @@ async def _download_and_deliver(
             pass
 
     finally:
+        await job_queue.release_slot(req_id)
         if upload_path_str:
             media_cache.release_file_use(upload_path_str)
         cleanup_temp_dir(temp_dir)
@@ -774,22 +826,6 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
     # Maintenance mode check
     if is_maintenance_mode():
         await message.reply("🛠 Bot is temporarily undergoing maintenance. Please try again shortly.")
-        return
-
-    # Per-user rate limiting (relaxed in groups to avoid dropping different user messages)
-    now = time.time()
-    last_req = USER_LAST_REQUEST_TIME.get(user_id, 0.0)
-    if now - last_req < USER_RATE_LIMIT_SECONDS:
-        wait_secs = int(USER_RATE_LIMIT_SECONDS - (now - last_req)) + 1
-        if not is_group:
-            await message.reply(f"⏳ Please wait {wait_secs}s before sending another link.")
-        return
-    USER_LAST_REQUEST_TIME[user_id] = now
-
-    # Concurrency limit per user via centralized JobQueueManager
-    if job_queue.is_user_busy(user_id):
-        if not is_group:
-            await message.reply("⚠️ You already have a download in progress. Please wait for it to complete.")
         return
 
     t_start = time.time()
@@ -827,6 +863,7 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
             user_mention=user_mention,
             is_group=is_group,
             t_start=t_start,
+            original_url=url,
         )
         if delivered:
             job_queue.finish_job(req_id, success=True)
@@ -859,6 +896,7 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
                     user_mention=user_mention,
                     is_group=is_group,
                     t_start=t_start,
+                    original_url=url,
                 )
                 if delivered:
                     job_queue.finish_job(req_id, success=True)
@@ -977,30 +1015,64 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
 
 @media_router.message(
     F.chat.type.in_({ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP}),
-    lambda msg: not ((msg.text and msg.text.startswith("/")) or (msg.caption and msg.caption.startswith("/")))
-    and bool(extract_all_media_urls_from_message(msg)),
+    (F.text | F.caption),
+)
+@media_router.edited_message(
+    F.chat.type.in_({ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP}),
+    (F.text | F.caption),
 )
 async def media_url_handler(message: Message) -> None:
     """
     Main URL message handler for private chats, groups, and supergroups.
     Automatically detects and processes supported media URLs without requiring commands.
     """
+    print(f"[AUTO URL CHECK] chat={message.chat.id} text={message.text!r}")
+
+    text = message.text or message.caption or ""
+    urls = extract_all_media_urls_from_message(message)
+    if not urls:
+        if text.startswith("/"):
+            return
+        logger.debug(
+            f"NO URL DETECTED: message {message.message_id} in {message.chat.type} contains no supported media URLs"
+        )
+        if message.chat.type == ChatType.PRIVATE:
+            guide_text = (
+                "💡 <b>Send any public video or music link to download!</b>\n\n"
+                "• 🔴 <b>YouTube:</b> Videos, Shorts\n"
+                "• 📸 <b>Instagram:</b> Reels, Videos\n"
+                "• 🔵 <b>Facebook:</b> Videos, Reels\n"
+                "• 🌐 TikTok, X, Reddit, Vimeo, Twitch, and more\n\n"
+                "Use /help for commands or add me to a group!"
+            )
+            await message.reply(guide_text)
+        return
+
     # ── Diagnostic: confirms update reached this handler (not blocked by Privacy Mode) ──
-    text_preview = (message.text or message.caption or "<media>")[:80]
+    text_preview = text[:80]
     logger.info(
         f"UPDATE RECEIVED: chat_type={message.chat.type} "
         f"chat_id={message.chat.id} message_id={message.message_id} "
         f"text={text_preview!r}"
     )
 
-    urls = extract_all_media_urls_from_message(message)
-    if not urls:
-        logger.debug(
-            f"NO URL DETECTED: message {message.message_id} in {message.chat.type} contains no supported media URLs"
-        )
-        return
+    for u in urls:
+        print(f"[AUTO URL] detected: {u}")
 
     is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    user = message.from_user
+    user_id = user.id if user else 0
+
+    # Rate limiting per message in private chat
+    if not is_group and user_id:
+        now = time.time()
+        last_req = USER_LAST_REQUEST_TIME.get(user_id, 0.0)
+        if now - last_req < USER_RATE_LIMIT_SECONDS:
+            wait_secs = int(USER_RATE_LIMIT_SECONDS - (now - last_req)) + 1
+            await message.reply(f"⏳ Please wait {wait_secs}s before sending another link.")
+            return
+        USER_LAST_REQUEST_TIME[user_id] = now
+
     if is_group:
         logger.info("GROUP MESSAGE RECEIVED")
         record_group_update(message.chat.id)
@@ -1008,11 +1080,11 @@ async def media_url_handler(message: Message) -> None:
     logger.info(f"CHAT TYPE: {message.chat.type}")
     logger.info(f"MESSAGE ID: {message.message_id}")
 
-    # Process sequentially to avoid exceeding concurrency limits
+    # Launch URL processing concurrently with 1.0s stagger between launches
     for idx, u in enumerate(urls[:5]):
         if idx > 0:
             await asyncio.sleep(1.0)
-        await _process_single_media_url(message=message, url=u, is_group=is_group)
+        asyncio.create_task(_process_single_media_url(message=message, url=u, is_group=is_group))
 
 
 @media_router.callback_query(F.data.startswith("q:"))
@@ -1040,9 +1112,6 @@ async def quality_choice_callback(callback: CallbackQuery) -> None:
         return
 
     user_id = callback.from_user.id
-    if job_queue.is_user_busy(user_id):
-        await callback.answer("⚠️ Download already in progress.", show_alert=True)
-        return
 
     status_msg = req_data["status_msg"]
     cancel_kb = req_data["cancel_kb"]
@@ -1144,12 +1213,17 @@ async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
         await callback.answer("⚠️ Media cache expired. Please send the link again.", show_alert=True)
         return
 
+    source_url = cached_entry.normalized_url or ""
+    caption = build_media_caption(source_url)
+
     # Fast Path: Telegram audio file_id already cached
     if cached_entry.telegram_audio_id and callback.message:
         await callback.answer()
         try:
             await callback.message.reply_audio(
                 audio=cached_entry.telegram_audio_id,
+                caption=caption,
+                parse_mode="HTML",
                 title=cached_entry.title,
                 performer=cached_entry.platform.capitalize(),
                 duration=int(cached_entry.duration) if cached_entry.duration else 0,
@@ -1191,6 +1265,8 @@ async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
         try:
             sent_audio = await callback.message.reply_audio(
                 audio=audio_file,
+                caption=caption,
+                parse_mode="HTML",
                 title=short_title,
                 performer=cached_entry.platform.capitalize(),
                 duration=int(cached_entry.duration) if cached_entry.duration else 0,
@@ -1199,6 +1275,8 @@ async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
         except Exception:
             sent_audio = await callback.message.answer_audio(
                 audio=audio_file,
+                caption=caption,
+                parse_mode="HTML",
                 title=short_title,
                 performer=cached_entry.platform.capitalize(),
                 duration=int(cached_entry.duration) if cached_entry.duration else 0,

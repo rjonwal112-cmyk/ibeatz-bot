@@ -67,7 +67,7 @@ def index():
 
 @flask_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "@ibeatzbotbot"}, 200
+    return {"status": "ok", "bot": "@ibeatzfetch_bot"}, 200
 
 
 def _run_flask():
@@ -147,12 +147,14 @@ async def main() -> None:
     # Diagnostic Update Outer Middleware
     @dp.update.outer_middleware()
     async def log_update_middleware(handler, event, data):
-        msg = event.message
+        msg = event.message or event.edited_message
         if msg:
             chat_type = msg.chat.type
             user_info = f"{msg.from_user.id} (@{msg.from_user.username})" if msg.from_user else "unknown"
-            text_preview = (msg.text or msg.caption or "<media>")[:60]
+            text_preview = (msg.text or msg.caption or f"<{event.event_type}>")[:60]
             logger.info(f"📥 [UPDATE #{event.update_id}] Chat={msg.chat.id} ({chat_type}) User={user_info} Content={text_preview!r}")
+        else:
+            logger.info(f"📥 [UPDATE #{event.update_id}] EventType={event.event_type}")
         return await handler(event, data)
 
     # Verify Telegram authentication
@@ -161,8 +163,11 @@ async def main() -> None:
         logger.info(
             f"Telegram authentication: SUCCESS\n"
             f"Bot username: @{bot_user.username}\n"
-            f"Bot Username: @{bot_user.username}\n"
             f"Bot ID: {bot_user.id}"
+        )
+        logger.info(
+            f"GROUP ACCESS CHECK: can_read_all_group_messages="
+            f"{getattr(bot_user, 'can_read_all_group_messages', None)}"
         )
     except Exception as conn_err:
         logger.error(f"❌ Telegram authentication FAILED: Invalid or expired bot token. Error: {conn_err}")
@@ -209,13 +214,13 @@ async def main() -> None:
     print("=" * 60)
     print("⚠️  TELEGRAM GROUP PRIVACY MODE NOTICE:")
     print("  Telegram bots have Privacy Mode enabled by default by Telegram.")
-    print("  To allow @ibeatzbotbot to auto-detect media URLs in groups without")
+    print(f"  To allow @{bot_user.username} to auto-detect media URLs in groups without")
     print("  requiring a bot mention or slash command:")
     print("    1. Open @BotFather in Telegram")
     print("    2. Send /setprivacy")
-    print("    3. Select @ibeatzbotbot")
+    print(f"    3. Select @{bot_user.username}")
     print("    4. Select 'Disable'")
-    print("  Alternatively, grant @ibeatzbotbot Administrator status in the group.")
+    print(f"  Alternatively, grant @{bot_user.username} Administrator status in the group.")
     print("=" * 60)
 
     try:
@@ -266,7 +271,7 @@ async def main() -> None:
     # Start 24/7 Keep-Alive Flask Web Server on Port 10000 for Render
     keep_alive()
 
-    logger.info("Starting @ibeatzbotbot media downloader engine...")
+    logger.info(f"Starting @{bot_user.username} media downloader engine...")
     # Explicitly request all update types we need: message (all chats) + callback_query
     _allowed_updates = ["message", "edited_message", "callback_query", "my_chat_member"]
     logger.info(f"Polling with allowed_updates: {_allowed_updates}")

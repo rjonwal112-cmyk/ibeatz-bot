@@ -4,12 +4,17 @@ import time
 from typing import Any, Optional
 
 from aiogram import F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from downloader import cancel_download
-from handlers.media import extract_media_url_from_message, media_url_handler
+from handlers.media import (
+    _process_single_media_url,
+    extract_media_url_from_message,
+    media_url_handler,
+)
 from services.database import db
 from services.queue_manager import job_queue
 
@@ -87,7 +92,7 @@ async def command_start_handler(message: Message) -> None:
 
     welcome_text = (
         f"👋 Hi <b>{user_name}</b>!\n\n"
-        "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzbotbot)\n"
+        "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzfetch_bot)\n"
         "High-performance media downloader for Telegram.\n\n"
         "Send any supported public video URL directly to begin downloading.\n\n"
         "• <b>Primary:</b> YouTube, Shorts, Instagram Reels, Facebook Videos\n"
@@ -144,7 +149,8 @@ async def command_download_handler(message: Message) -> None:
     logger.info(f"/download from user {message.from_user.id if message.from_user else 0}")
     url = extract_media_url_from_message(message)
     if url:
-        await media_url_handler(message)
+        is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+        await _process_single_media_url(message=message, url=url, is_group=is_group)
     else:
         guide_text = (
             "📥 <b>How to Download:</b>\n\n"
@@ -276,7 +282,7 @@ async def command_about_handler(message: Message) -> None:
     """Sends concise bot description and architecture info."""
     logger.info(f"/about from user {message.from_user.id if message.from_user else 0}")
     about_text = (
-        "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzbotbot)\n\n"
+        "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzfetch_bot)\n\n"
         "A high-performance Telegram media downloader built with Python, aiogram 3, yt-dlp, and FFmpeg.\n\n"
         "<b>Core Architecture:</b>\n"
         "• YouTube, Instagram & Facebook prioritized pipelines\n"
@@ -323,7 +329,7 @@ async def menu_callback_handler(callback: CallbackQuery) -> None:
         await callback.answer()
         welcome_text = (
             f"👋 Hi <b>{user_name}</b>!\n\n"
-            "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzbotbot)\n"
+            "⚡ <b>ɪʙᴇᴀᴛᴢ bot</b> (@ibeatzfetch_bot)\n"
             "High-performance media downloader for Telegram.\n\n"
             "Send any supported public video URL directly to begin downloading.\n\n"
             "• <b>Primary:</b> YouTube, Shorts, Instagram Reels, Facebook Videos\n"

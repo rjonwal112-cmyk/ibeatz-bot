@@ -548,6 +548,12 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         "extract_flat": False,
         "socket_timeout": 8,
         "http_headers": DEFAULT_HTTP_HEADERS,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios"],
+                "player_skip": ["configs", "webpage"],
+            }
+        },
     }
     if NODE_PATH:
         ydl_opts["js_runtimes"] = {"node": {"path": NODE_PATH}}
@@ -1060,8 +1066,15 @@ def _sync_download(
         "fragment_retries": 3,
         "extract_flat": False,
         "concurrent_fragment_downloads": 8,
-        "buffersize": 4 * 1024 * 1024,
+        "buffersize": 1024 * 1024,
+        "http_chunk_size": 10485760,
         "http_headers": DEFAULT_HTTP_HEADERS,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios"],
+                "player_skip": ["configs", "webpage"],
+            }
+        },
         "progress_hooks": [_progress_hook],
         "postprocessor_hooks": [_pp_hook],
     }
