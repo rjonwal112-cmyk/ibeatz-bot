@@ -725,56 +725,54 @@ def _extract_instagram_embed_fallback(url: str) -> Optional[dict]:
 def format_extraction_error(error: Any, url: str = "") -> str:
     """
     Translates extraction/download exceptions into precise, transparent technical reasons
-    (Private account, Login requirement, Age/Sensitive content barrier, Deleted/Unavailable,
-    Geographic restriction, Rate-limiting, or exact underlying platform error)
-    instead of opaque or generic rejection messages.
+    without adding subjective visual-content/category judgment or generic placeholders.
     """
     err_str = str(error).strip()
     err_lower = err_str.lower()
 
-    # 1. Private Account (Do not bypass)
+    # 1. Access / Audience Restrictions from source (Do not bypass, do not add visual category labels)
+    if any(k in err_lower for k in ("can't be seen by certain audiences", "not available to everyone", "certain audiences")):
+        return "🔒 Instagram: This content isn't available to everyone: It can't be seen by certain audiences."
+
+    # 2. Private Account (Do not bypass)
     if any(k in err_lower for k in ("this account is private", "private account", "only approved followers")):
         return "🔒 Private Account: This Instagram account is private. Content is only visible to approved followers."
 
-    # 2. Login Requirement (Do not bypass)
+    # 3. Login Requirement (Do not bypass)
     if any(k in err_lower for k in ("login required", "please log in", "checkpoint_required", "redirected to login", "sign in to view")):
         return "🔒 Login Required: Instagram requires authentication to access this content."
 
-    # 3. Age / Sensitive Content Access Controls (Do not bypass)
-    if any(k in err_lower for k in ("age-restricted", "age restricted", "sensitive content", "viewer discretion", "must be 18")):
-        return "🔞 Age / Sensitive Content: Instagram has restricted this post behind an age/sensitivity verification barrier."
+    # 4. Age Restriction (Only when explicitly reported by source)
+    if any(k in err_lower for k in ("age-restricted", "age restricted", "viewer discretion", "must be 18")):
+        return "🔞 Age Restricted: Instagram reports this post has an age verification restriction."
 
-    # 4. Deleted or Unavailable Content
-    if any(k in err_lower for k in ("not found", "deleted", "unavailable", "404", "this content isn't available")):
+    # 5. Deleted / Not Found Content (Only when explicitly reported as deleted/404)
+    if any(k in err_lower for k in ("does not exist", "post not found", "has been deleted", "deleted by the owner", "404 not found", "http error 404")):
         return "🚫 Post Unavailable: This post does not exist or has been deleted by the owner."
 
-    # 5. Geographic / Region Restriction
+    # 6. Geographic / Region Restriction
     if any(k in err_lower for k in ("geo-restricted", "geoblocked", "not available in your region", "not available in your country")):
         return "🌍 Region Restricted: This Instagram media is restricted in the server's geographic location."
 
-    # 6. Rate Limited / Temporary Block
+    # 7. Rate Limited / Temporary Block
     if any(k in err_lower for k in ("429", "too many requests", "rate limit", "temporarily blocked")):
         return "⏳ Rate Limited: Instagram is temporarily limiting requests. Please wait a minute and retry."
 
-    # 7. Empty Media Response
+    # 8. Empty Media Response
     if "empty media response" in err_lower:
-        return "⚠️ Empty Media: Instagram returned an empty response (post may be restricted, expired, or unavailable)."
+        return "⚠️ Empty Media: Instagram returned an empty response (post may be restricted or unavailable)."
 
-    # 8. File Size Limit
+    # 9. File Size Limit
     if "too large" in err_lower or "max_filesize" in err_lower:
         return "⚠️ File Size Limit: Media exceeds Telegram's file size limit (50 MB)."
 
-    # 9. Unsupported URL
-    if "unsupported url" in err_lower:
-        return "❌ Unsupported Link: This URL format is not supported."
-
-    # 10. Clean and expose underlying technical error
+    # 10. Clean and expose underlying technical error directly from platform
     clean_msg = re.sub(r"^ERROR:\s*\[[^\]]+\]\s*[^:]*:\s*", "", err_str, flags=re.IGNORECASE).strip()
     if clean_msg:
         first_line = clean_msg.split("\n")[0].strip()
         if len(first_line) > 140:
             first_line = first_line[:137] + "…"
-        return f"❌ Technical Reason: {first_line}"
+        return f"❌ Source Error: {first_line}"
 
     return "❌ Media extraction failed. Please check if the link is accessible."
 
@@ -804,6 +802,7 @@ def categorize_error(error: Any) -> tuple[str, str]:
         "login required", "please log in", "checkpoint_required", "redirected to login",
         "age-restricted", "sensitive content", "viewer discretion", "must be 18",
         "not found", "deleted", "unavailable", "404", "content isn't available",
+        "can't be seen by certain audiences", "not available to everyone", "certain audiences",
         "geo-restricted", "geoblocked", "not available in your region"
     )):
         return "source unavailable/restricted", "SOURCE_RESTRICTED"
@@ -1035,6 +1034,18 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         logger.info(f"whether video stream exists: {'YES' if (has_audio or (not is_carousel and has_video)) else 'NO'}")
         logger.info(f"whether audio stream exists: {'YES' if has_audio else 'NO'}")
 
+        if platform_info.key == "instagram":
+            ig_fmt_count = len(carousel_items) if is_carousel else len(info.get('formats') or [])
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info(f"[IG DEBUG] formats={ig_fmt_count}")
+            logger.info(f"[IG DEBUG] selected={max_quality}")
+            logger.info(f"[IG DEBUG] video_stream={'YES' if (has_audio or (not is_carousel and has_video)) else 'NO'}")
+            logger.info(f"[IG DEBUG] audio_stream={'YES' if has_audio else 'NO'}")
+            logger.info("[IG DEBUG] download_error=None")
+            logger.info(f"[IG DEBUG] ffprobe_video={'YES' if (not is_carousel and has_video) else 'NO'}")
+            logger.info(f"[IG DEBUG] ffprobe_audio={'YES' if has_audio else 'NO'}")
+
         extraction_time_s = time.time() - t_start
 
         # Store detected fields inside raw_info for cache restoration
@@ -1074,6 +1085,18 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         logger.error("whether audio stream exists: NO")
         logger.error(f"final exception/error: {type(e).__name__}: {e}")
         logger.error(f"error category: {err_cat}")
+
+        if platform_info.key == "instagram":
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info("[IG DEBUG] formats=0")
+            logger.info("[IG DEBUG] selected=None")
+            logger.info("[IG DEBUG] video_stream=NO")
+            logger.info("[IG DEBUG] audio_stream=NO")
+            logger.info(f"[IG DEBUG] download_error={e}")
+            logger.info("[IG DEBUG] ffprobe_video=NO")
+            logger.info("[IG DEBUG] ffprobe_audio=NO")
+
         return False, None, format_extraction_error(e, url)
     except Exception as e:
         err_cat, err_code = categorize_error(e)
@@ -1086,6 +1109,18 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
         logger.error("whether audio stream exists: NO")
         logger.error(f"final exception/error: {type(e).__name__}: {e}")
         logger.error(f"error category: {err_cat}")
+
+        if platform_info.key == "instagram":
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info("[IG DEBUG] formats=0")
+            logger.info("[IG DEBUG] selected=None")
+            logger.info("[IG DEBUG] video_stream=NO")
+            logger.info("[IG DEBUG] audio_stream=NO")
+            logger.info(f"[IG DEBUG] download_error={e}")
+            logger.info("[IG DEBUG] ffprobe_video=NO")
+            logger.info("[IG DEBUG] ffprobe_audio=NO")
+
         return False, None, format_extraction_error(e, url)
 
 
@@ -1338,6 +1373,18 @@ def _sync_download(
 
         logger.info(f"whether video stream exists: {'YES' if any(t == 'video' for t, _ in carousel_files) else 'NO'}")
         logger.info(f"whether audio stream exists: {'YES' if any(t == 'video' for t, _ in carousel_files) else 'NO'}")
+
+        if platform_info.key == "instagram":
+            has_v = any(t == 'video' for t, _ in carousel_files)
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info(f"[IG DEBUG] formats={len(carousel_files)}")
+            logger.info("[IG DEBUG] selected=carousel")
+            logger.info(f"[IG DEBUG] video_stream={'YES' if has_v else 'NO'}")
+            logger.info(f"[IG DEBUG] audio_stream={'YES' if has_v else 'NO'}")
+            logger.info("[IG DEBUG] download_error=None")
+            logger.info(f"[IG DEBUG] ffprobe_video={'YES' if has_v else 'NO'}")
+            logger.info(f"[IG DEBUG] ffprobe_audio={'YES' if has_v else 'NO'}")
 
         return DownloadResult(
             success=True,
@@ -1734,6 +1781,17 @@ def _sync_download(
                 f"VideoStream: {has_v_stream} | AudioStream: {has_a_stream} | Error: None"
             )
 
+            if platform_info.key == "instagram":
+                logger.info(f"[IG DEBUG] URL={url}")
+                logger.info("[IG DEBUG] extractor=instagram")
+                logger.info(f"[IG DEBUG] formats={len(info_dict.get('formats') or [])}")
+                logger.info(f"[IG DEBUG] selected={info_dict.get('format_id')}")
+                logger.info(f"[IG DEBUG] video_stream={'YES' if has_v_stream else 'NO'}")
+                logger.info(f"[IG DEBUG] audio_stream={'YES' if has_a_stream else 'NO'}")
+                logger.info("[IG DEBUG] download_error=None")
+                logger.info(f"[IG DEBUG] ffprobe_video={'YES' if has_v_stream else 'NO'}")
+                logger.info(f"[IG DEBUG] ffprobe_audio={'YES' if has_a_stream else 'NO'}")
+
             # Enforce Telegram file-size limit
             if file_size > MAX_FILE_SIZE_BYTES:
                 record_download_finish(success=False)
@@ -1919,6 +1977,17 @@ def _sync_download(
             f"VideoStream: False | AudioStream: False | "
             f"Category: {err_cat} | ErrorCode: {err_code} | Error: {e}"
         )
+        if platform_info.key == "instagram":
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info("[IG DEBUG] formats=0")
+            logger.info("[IG DEBUG] selected=None")
+            logger.info("[IG DEBUG] video_stream=NO")
+            logger.info("[IG DEBUG] audio_stream=NO")
+            logger.info(f"[IG DEBUG] download_error={e}")
+            logger.info("[IG DEBUG] ffprobe_video=NO")
+            logger.info("[IG DEBUG] ffprobe_audio=NO")
+
         msg = format_extraction_error(e, url)
         return DownloadResult(
             success=False,
@@ -1936,6 +2005,17 @@ def _sync_download(
             f"VideoStream: False | AudioStream: False | "
             f"Category: {err_cat} | ErrorCode: {err_code} | Error: {e}"
         )
+        if platform_info.key == "instagram":
+            logger.info(f"[IG DEBUG] URL={url}")
+            logger.info("[IG DEBUG] extractor=instagram")
+            logger.info("[IG DEBUG] formats=0")
+            logger.info("[IG DEBUG] selected=None")
+            logger.info("[IG DEBUG] video_stream=NO")
+            logger.info("[IG DEBUG] audio_stream=NO")
+            logger.info(f"[IG DEBUG] download_error={e}")
+            logger.info("[IG DEBUG] ffprobe_video=NO")
+            logger.info("[IG DEBUG] ffprobe_audio=NO")
+
         logger.error(f"Unexpected download error for {url}: {e}", exc_info=True)
         return DownloadResult(
             success=False,
