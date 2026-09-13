@@ -67,7 +67,6 @@ QUALITY_720P = "720p"
 QUALITY_480P = "480p"
 QUALITY_360P = "360p"
 QUALITY_240P = "240p"
-QUALITY_AUDIO = "audio"
 
 QUALITY_LABELS = {
     QUALITY_HIGHEST: "Highest Quality",
@@ -79,7 +78,6 @@ QUALITY_LABELS = {
     QUALITY_480P: "480p",
     QUALITY_360P: "360p",
     QUALITY_240P: "240p",
-    QUALITY_AUDIO: "Audio Only (MP3)",
 }
 
 

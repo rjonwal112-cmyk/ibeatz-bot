@@ -1,4 +1,3 @@
-from services.audio_extractor import extract_audio_from_video
 from services.cache import (
     IN_FLIGHT_DOWNLOADS,
     IN_FLIGHT_LOCK,
@@ -18,7 +17,6 @@ from services.stats import (
     get_stats_summary,
     init_stats,
     is_maintenance_mode,
-    record_audio_extraction,
     record_cache_hit,
     record_delivery_metric,
     record_download_finish,
@@ -52,7 +50,6 @@ __all__ = [
     "IN_FLIGHT_LOCK",
     "job_queue",
     "JobStatus",
-    "extract_audio_from_video",
     "init_stats",
     "is_maintenance_mode",
     "set_maintenance_mode",
@@ -60,7 +57,6 @@ __all__ = [
     "record_cache_hit",
     "record_download_start",
     "record_download_finish",
-    "record_audio_extraction",
     "record_delivery_metric",
     "record_error",
     "get_stats_summary",

@@ -19,7 +19,6 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import (
-    QUALITY_AUDIO,
     QUALITY_HIGHEST,
     QUALITY_LABELS,
     USER_RATE_LIMIT_SECONDS,
@@ -38,12 +37,10 @@ from services import (
     IN_FLIGHT_LOCK,
     CacheEntry,
     JobStatus,
-    extract_audio_from_video,
     is_maintenance_mode,
     job_queue,
     media_cache,
     normalize_media_url,
-    record_audio_extraction,
     record_cache_hit,
     record_request,
 )
@@ -219,13 +216,6 @@ async def _deliver_cached_media(
     source_url = entry.normalized_url or original_url or ""
     caption = build_media_caption(source_url)
 
-    # Post-delivery Audio button
-    audio_kb = InlineKeyboardBuilder()
-    audio_kb.button(
-        text="🎵 Audio",
-        callback_data=f"aud:{entry.platform[:8]}:{entry.media_id[:24]}:{entry.requested_quality[:6]}:{user_id}",
-    )
-
     t_send_start = time.time()
     sent_msg = None
 
@@ -250,7 +240,6 @@ async def _deliver_cached_media(
                     parse_mode="HTML",
                     duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                     supports_streaming=True,
-                    reply_markup=audio_kb.as_markup(),
                     request_timeout=60,
                 )
         except Exception as id_err:
@@ -285,7 +274,6 @@ async def _deliver_cached_media(
                         parse_mode="HTML",
                         duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                         supports_streaming=True,
-                        reply_markup=audio_kb.as_markup(),
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -297,7 +285,6 @@ async def _deliver_cached_media(
                             parse_mode="HTML",
                             duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                             supports_streaming=True,
-                            reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -307,7 +294,6 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
                         except Exception:
@@ -315,27 +301,8 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
-                except Exception as ans_err:
-                    logger.warning(f"answer_video failed ({ans_err}), falling back to document")
-                    try:
-                        sent_msg = await message.reply_document(
-                            document=media_file,
-                            caption=caption,
-                            parse_mode="HTML",
-                            reply_markup=audio_kb.as_markup(),
-                            request_timeout=300,
-                        )
-                    except Exception:
-                        sent_msg = await message.answer_document(
-                            document=media_file,
-                            caption=caption,
-                            parse_mode="HTML",
-                            reply_markup=audio_kb.as_markup(),
-                            request_timeout=300,
-                        )
 
             # Store resulting telegram_file_id for future 0.1s instant deliveries
             if sent_msg and sent_msg.video:
@@ -526,12 +493,6 @@ async def _download_and_deliver(
         source_url = url or ""
         caption = build_media_caption(source_url)
 
-        audio_kb = InlineKeyboardBuilder()
-        audio_kb.button(
-            text="🎵 Audio",
-            callback_data=f"aud:{platform_key[:8]}:{media_id[:24]}:{quality[:6]}:{user_id}",
-        )
-
         job_queue.update_status(req_id, JobStatus.UPLOADING)
         if status_msg:
             try:
@@ -661,7 +622,6 @@ async def _download_and_deliver(
                         width=v_width,
                         height=v_height,
                         supports_streaming=True,
-                        reply_markup=audio_kb.as_markup(),
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -675,7 +635,6 @@ async def _download_and_deliver(
                             width=v_width,
                             height=v_height,
                             supports_streaming=True,
-                            reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -685,7 +644,6 @@ async def _download_and_deliver(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
-                                reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
                         except Exception:
@@ -694,7 +652,6 @@ async def _download_and_deliver(
                                     document=media_file,
                                     caption=caption,
                                     parse_mode="HTML",
-                                    reply_markup=audio_kb.as_markup(),
                                     request_timeout=300,
                                 )
                             except Exception as doc_err:
@@ -1186,118 +1143,3 @@ async def retry_callback_handler(callback: CallbackQuery) -> None:
         else:
             await callback.message.edit_text("⚠️ Please send the link again.")
 
-
-@media_router.callback_query(F.data.startswith("aud:"))
-async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
-    """
-    Extracts high-quality MP3 from the local cached video on demand.
-    Never re-downloads from remote source.
-    """
-    parts = callback.data.split(":")
-    if len(parts) < 5:
-        await callback.answer("Invalid audio request.", show_alert=True)
-        return
-
-    plat_key = parts[1]
-    media_id = parts[2]
-    quality = parts[3]
-    requester_id = int(parts[4])
-
-    # Enforce callback requester ownership in groups
-    if callback.from_user.id != requester_id:
-        await callback.answer("⚠️ Only the requester can interact with this button.", show_alert=True)
-        return
-
-    cached_entry = await media_cache.get(plat_key, media_id, quality)
-    if not cached_entry:
-        await callback.answer("⚠️ Media cache expired. Please send the link again.", show_alert=True)
-        return
-
-    source_url = cached_entry.normalized_url or ""
-    caption = build_media_caption(source_url)
-
-    # Fast Path: Telegram audio file_id already cached
-    if cached_entry.telegram_audio_id and callback.message:
-        await callback.answer()
-        try:
-            await callback.message.reply_audio(
-                audio=cached_entry.telegram_audio_id,
-                caption=caption,
-                parse_mode="HTML",
-                title=cached_entry.title,
-                performer=cached_entry.platform.capitalize(),
-                duration=int(cached_entry.duration) if cached_entry.duration else 0,
-            )
-            return
-        except Exception:
-            pass
-
-    video_path = Path(cached_entry.file_path) if cached_entry.file_path else None
-    if not video_path or not video_path.exists():
-        await callback.answer("⚠️ Cached video is no longer on disk. Please send link again.", show_alert=True)
-        return
-
-    await callback.answer("⏳ Extracting audio…")
-    status_msg = None
-    try:
-        status_msg = await callback.message.reply("⏳ Extracting audio…")
-    except Exception:
-        pass
-
-    media_cache.acquire_file_use(str(video_path))
-    try:
-        success, audio_path, err = await extract_audio_from_video(
-            video_path=video_path,
-            title=cached_entry.title,
-            artist=cached_entry.platform.capitalize(),
-        )
-
-        if not success or not audio_path:
-            if status_msg:
-                await status_msg.edit_text(f"❌ {err or 'Audio extraction failed.'}")
-            return
-
-        record_audio_extraction()
-        audio_file = FSInputFile(audio_path)
-        short_title = (cached_entry.title[:50] + "...") if len(cached_entry.title) > 55 else cached_entry.title
-
-        sent_audio = None
-        try:
-            sent_audio = await callback.message.reply_audio(
-                audio=audio_file,
-                caption=caption,
-                parse_mode="HTML",
-                title=short_title,
-                performer=cached_entry.platform.capitalize(),
-                duration=int(cached_entry.duration) if cached_entry.duration else 0,
-                request_timeout=300,
-            )
-        except Exception:
-            sent_audio = await callback.message.answer_audio(
-                audio=audio_file,
-                caption=caption,
-                parse_mode="HTML",
-                title=short_title,
-                performer=cached_entry.platform.capitalize(),
-                duration=int(cached_entry.duration) if cached_entry.duration else 0,
-                request_timeout=300,
-            )
-
-        # Store telegram_audio_id in SQLite for instant repeat delivery
-        if sent_audio and sent_audio.audio:
-            await media_cache.update_telegram_file_id(
-                platform=plat_key,
-                media_id=media_id,
-                quality=quality,
-                file_id=sent_audio.audio.file_id,
-                is_audio=True,
-            )
-
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-    finally:
-        media_cache.release_file_use(str(video_path))

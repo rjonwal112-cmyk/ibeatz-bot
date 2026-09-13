@@ -17,7 +17,6 @@ _STATS = {
     "successful_downloads": 0,
     "failed_downloads": 0,
     "cache_hits": 0,
-    "audio_extractions": 0,
     "active_downloads": 0,
 }
 
@@ -66,8 +65,6 @@ def record_download_finish(success: bool) -> None:
         _STATS["failed_downloads"] += 1
 
 
-def record_audio_extraction() -> None:
-    _STATS["audio_extractions"] += 1
 
 
 async def record_delivery_metric(

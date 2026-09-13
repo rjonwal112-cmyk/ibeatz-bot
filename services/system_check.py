@@ -93,7 +93,7 @@ def log_startup_system_report() -> None:
             f"✅ [SYSTEM CHECK] FFmpeg is INSTALLED & ACTIVE\n"
             f"• Binary: {ffmpeg_bin}\n"
             f"• Version: {version}\n"
-            f"• Capabilities: Full stream merging (1080p+), MP4 remuxing, MP3 extraction enabled\n"
+            f"• Capabilities: Full stream merging (1080p+), MP4 remuxing enabled\n"
             f"=============================================================="
         )
     else:
@@ -101,7 +101,6 @@ def log_startup_system_report() -> None:
             f"\n==============================================================\n"
             f"⚠️ [SYSTEM CHECK] FFmpeg is NOT detected!\n"
             f"• Quality limit: Progressive formats only (max 720p/360p)\n"
-            f"• Audio extraction will be limited to direct audio streams\n"
             f"• Install via: winget install Gyan.FFmpeg\n"
             f"=============================================================="
         )

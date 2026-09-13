@@ -27,7 +27,6 @@ from config import (
     QUALITY_480P,
     QUALITY_360P,
     QUALITY_240P,
-    QUALITY_AUDIO,
     QUALITY_BEST,
     QUALITY_HIGHEST,
     is_ffmpeg_installed,
@@ -444,16 +443,6 @@ def _build_format_options(
     """
     postprocessors = []
     merge_output_format = None
-
-    if quality == QUALITY_AUDIO:
-        format_spec = "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best"
-        if has_ffmpeg:
-            postprocessors.append({
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            })
-        return format_spec, postprocessors, merge_output_format
 
     plat_key = getattr(platform_info, "key", "").lower()
 
@@ -1379,12 +1368,12 @@ def _sync_download(
                     error_message=(
                         f"⚠️ Media exceeds Telegram's upload limit "
                         f"({actual_mb:.1f} MB > {limit_mb} MB).\n"
-                        f"Try selecting a lower resolution (e.g. 720p/480p) or extract audio."
+                        f"Try selecting a lower resolution (e.g. 720p/480p)."
                     ),
                     temp_dir=temp_dir,
                 )
 
-            is_audio_file = quality == QUALITY_AUDIO or ext in (
+            is_audio_file = ext in (
                 ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"
             )
 

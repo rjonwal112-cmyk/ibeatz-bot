@@ -55,12 +55,10 @@ def _build_back_keyboard() -> Any:
 
 async def _render_settings_view(user_id: int) -> tuple[str, Any]:
     pref_quality = await db.get_user_setting(user_id, "preferred_quality", "highest")
-    auto_audio = await db.get_user_setting(user_id, "auto_audio", "off")
 
     text = (
         "⚙️ <b>Personal Preferences</b>\n\n"
-        f"• <b>Preferred YouTube Quality:</b> {html.escape(pref_quality.capitalize())}\n"
-        f"• <b>Auto-Extract Audio:</b> {'Enabled' if auto_audio == 'on' else 'Disabled'}\n\n"
+        f"• <b>Preferred YouTube Quality:</b> {html.escape(pref_quality.capitalize())}\n\n"
         "<i>Select an option below to update your preference:</i>"
     )
 
@@ -69,11 +67,8 @@ async def _render_settings_view(user_id: int) -> tuple[str, Any]:
     for q in qualities:
         mark = "✓ " if pref_quality == q else ""
         builder.button(text=f"{mark}{q.capitalize()}", callback_data=f"menu:set_q:{q}")
-    audio_label = "🔊 Auto-Audio: ON" if auto_audio == "on" else "🔈 Auto-Audio: OFF"
-    new_audio_state = "off" if auto_audio == "on" else "on"
-    builder.button(text=audio_label, callback_data=f"menu:set_aud:{new_audio_state}")
     builder.button(text="« Back to Menu", callback_data="menu:start")
-    builder.adjust(2, 2, 1, 1)
+    builder.adjust(2, 2, 1)
     return text, builder.as_markup()
 
 
@@ -117,8 +112,7 @@ async def command_help_handler(message: Message) -> None:
         "3. In groups, progress updates are cleaned up automatically upon completion.\n\n"
         "<b>Platform Quality Policies:</b>\n"
         "• <b>Instagram & Facebook:</b> Automatically downloads highest available quality (zero friction).\n"
-        "• <b>YouTube & Others:</b> Shows genuine resolution options (1080p, 720p, 480p, 360p) if available.\n"
-        "• <b>Audio Extraction:</b> Tap <code>[🎵 Audio]</code> on any delivered video for instant MP3.\n\n"
+        "• <b>YouTube & Others:</b> Shows genuine resolution options (1080p, 720p, 480p, 360p) if available.\n\n"
         "<b>Cache & Performance:</b>\n"
         "• Previously downloaded videos are delivered instantly (~0.1s) without re-downloading.\n"
         "• Simultaneous requests for the same media share a single download task.\n\n"
@@ -289,7 +283,6 @@ async def command_about_handler(message: Message) -> None:
         "• Multi-layer SQLite caching (instant ~0.1s telegram_file_id re-delivery)\n"
         "• Singleflight request coalescing (prevents duplicate downloads)\n"
         "• Lossless stream-copy remuxing (zero re-encoding)\n"
-        "• On-demand high-fidelity MP3 extraction\n"
         "• Group and supergroup friendly"
     )
     await message.answer(about_text)
@@ -346,8 +339,7 @@ async def menu_callback_handler(callback: CallbackQuery) -> None:
             "1. <b>Send a Link:</b> Paste any public video link into the chat, or send <code>/download &lt;url&gt;</code>.\n"
             "2. <b>Automatic Quality:</b> Instagram and Facebook videos download in the highest available quality automatically.\n"
             "3. <b>Quality Choice:</b> YouTube videos with 1080p+ present resolution options (1080p, 720p, 480p, 360p).\n"
-            "4. <b>Audio Extraction:</b> Tap <code>[🎵 Audio]</code> on any delivered video to get a high-quality MP3.\n"
-            "5. <b>Cancel Anytime:</b> Use <code>/cancel</code> during download to stop an in-flight job."
+            "4. <b>Cancel Anytime:</b> Use <code>/cancel</code> during download to stop an in-flight job."
         )
         if callback.message:
             await callback.message.edit_text(text, reply_markup=_build_back_keyboard())
@@ -428,14 +420,6 @@ async def menu_callback_handler(callback: CallbackQuery) -> None:
         new_q = callback.data.split(":")[2]
         await db.set_user_setting(user_id, "preferred_quality", new_q)
         await callback.answer(f"Quality preference updated to {new_q.capitalize()}")
-        text, kb = await _render_settings_view(user_id)
-        if callback.message:
-            await callback.message.edit_text(text, reply_markup=kb)
-
-    elif action == "set_aud":
-        new_aud = callback.data.split(":")[2]
-        await db.set_user_setting(user_id, "auto_audio", new_aud)
-        await callback.answer(f"Auto-Audio set to {new_aud.upper()}")
         text, kb = await _render_settings_view(user_id)
         if callback.message:
             await callback.message.edit_text(text, reply_markup=kb)
