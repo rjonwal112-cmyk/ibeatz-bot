@@ -11,12 +11,17 @@ from services.platforms import (
     detect_platform_from_url,
     extract_canonical_id,
 )
+from services.audio_extractor import (
+    download_audio_from_url,
+    extract_audio_from_video,
+)
 from services.queue_manager import Job, JobQueueManager, JobStatus, job_queue
 from services.stats import (
     check_disk_space,
     get_stats_summary,
     init_stats,
     is_maintenance_mode,
+    record_audio_extraction,
     record_cache_hit,
     record_delivery_metric,
     record_download_finish,
@@ -57,8 +62,11 @@ __all__ = [
     "record_cache_hit",
     "record_download_start",
     "record_download_finish",
+    "record_audio_extraction",
     "record_delivery_metric",
     "record_error",
+    "extract_audio_from_video",
+    "download_audio_from_url",
     "get_stats_summary",
     "check_disk_space",
 ]

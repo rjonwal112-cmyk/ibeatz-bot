@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import mimetypes
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -37,10 +38,13 @@ from services import (
     IN_FLIGHT_LOCK,
     CacheEntry,
     JobStatus,
+    download_audio_from_url,
+    extract_audio_from_video,
     is_maintenance_mode,
     job_queue,
     media_cache,
     normalize_media_url,
+    record_audio_extraction,
     record_cache_hit,
     record_request,
 )
@@ -223,6 +227,14 @@ async def _deliver_cached_media(
         ".jpg", ".jpeg", ".png", ".webp"
     )
 
+    audio_kb = None
+    if not is_photo:
+        audio_kb = InlineKeyboardBuilder()
+        audio_kb.button(
+            text="🎵 Audio",
+            callback_data=f"aud:{entry.platform[:8]}:{entry.media_id[:24]}:{entry.requested_quality[:6]}:{user_id}",
+        )
+
     # Fast Path 1: Telegram file_id (instant 0.1s delivery)
     if entry.telegram_file_id:
         try:
@@ -240,6 +252,7 @@ async def _deliver_cached_media(
                     parse_mode="HTML",
                     duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                     supports_streaming=True,
+                    reply_markup=audio_kb.as_markup() if audio_kb else None,
                     request_timeout=60,
                 )
         except Exception as id_err:
@@ -274,6 +287,7 @@ async def _deliver_cached_media(
                         parse_mode="HTML",
                         duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                         supports_streaming=True,
+                        reply_markup=audio_kb.as_markup() if audio_kb else None,
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -285,6 +299,7 @@ async def _deliver_cached_media(
                             parse_mode="HTML",
                             duration=int(entry.duration) if (entry.duration and int(entry.duration) > 0) else None,
                             supports_streaming=True,
+                            reply_markup=audio_kb.as_markup() if audio_kb else None,
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -294,6 +309,7 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
+                                reply_markup=audio_kb.as_markup() if audio_kb else None,
                                 request_timeout=300,
                             )
                         except Exception:
@@ -301,6 +317,7 @@ async def _deliver_cached_media(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
+                                reply_markup=audio_kb.as_markup() if audio_kb else None,
                                 request_timeout=300,
                             )
 
@@ -613,6 +630,12 @@ async def _download_and_deliver(
                 v_duration = int(info.duration) if (info and info.duration and int(info.duration) > 0) else None
                 v_width = int(info.width) if (info and info.width and int(info.width) > 0) else None
                 v_height = int(info.height) if (info and info.height and int(info.height) > 0) else None
+
+                audio_kb = InlineKeyboardBuilder()
+                audio_kb.button(
+                    text="🎵 Audio",
+                    callback_data=f"aud:{platform_key[:8]}:{media_id[:24]}:{quality[:6]}:{user_id}",
+                )
                 try:
                     sent_msg = await message.reply_video(
                         video=media_file,
@@ -622,6 +645,7 @@ async def _download_and_deliver(
                         width=v_width,
                         height=v_height,
                         supports_streaming=True,
+                        reply_markup=audio_kb.as_markup(),
                         request_timeout=300,
                     )
                 except Exception as vid_err:
@@ -635,6 +659,7 @@ async def _download_and_deliver(
                             width=v_width,
                             height=v_height,
                             supports_streaming=True,
+                            reply_markup=audio_kb.as_markup(),
                             request_timeout=300,
                         )
                     except Exception as ans_err:
@@ -644,6 +669,7 @@ async def _download_and_deliver(
                                 document=media_file,
                                 caption=caption,
                                 parse_mode="HTML",
+                                reply_markup=audio_kb.as_markup(),
                                 request_timeout=300,
                             )
                         except Exception:
@@ -652,6 +678,7 @@ async def _download_and_deliver(
                                     document=media_file,
                                     caption=caption,
                                     parse_mode="HTML",
+                                    reply_markup=audio_kb.as_markup(),
                                     request_timeout=300,
                                 )
                             except Exception as doc_err:
@@ -1142,4 +1169,172 @@ async def retry_callback_handler(callback: CallbackQuery) -> None:
             await media_url_handler(target_msg)
         else:
             await callback.message.edit_text("⚠️ Please send the link again.")
+
+
+@media_router.callback_query(F.data.startswith("aud:"))
+async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
+    """
+    Extracts high-quality MP3 from delivered video.
+    If local video was cleaned up, seamlessly falls back to downloading audio
+    stream directly from the source URL using yt-dlp + FFmpeg.
+    Caches telegram_audio_id in SQLite so repeat taps are instant (0.1s).
+    """
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Invalid audio request.", show_alert=True)
+        return
+
+    plat_key = parts[1]
+    media_id = parts[2]
+    quality = parts[3]
+
+    cached_entry = await media_cache.get(plat_key, media_id, quality)
+    if not cached_entry:
+        cached_entry = await media_cache.get(plat_key, media_id, "highest")
+
+    # Determine source URL from:
+    # 1. cached_entry.normalized_url
+    # 2. callback.message caption_entities (text_link)
+    # 3. Canonical URL reconstruction from platform and media_id
+    source_url = cached_entry.normalized_url if (cached_entry and cached_entry.normalized_url) else ""
+    if not source_url and callback.message and callback.message.caption_entities:
+        for ent in callback.message.caption_entities:
+            if ent.type == "text_link" and ent.url and "ibeatzfetch_bot" not in ent.url:
+                source_url = ent.url
+                break
+
+    if not source_url:
+        if plat_key == "youtube":
+            source_url = f"https://www.youtube.com/watch?v={media_id}"
+        elif plat_key == "instagram":
+            source_url = f"https://www.instagram.com/reel/{media_id}/"
+        elif plat_key == "facebook":
+            source_url = f"https://www.facebook.com/watch/?v={media_id}"
+        elif plat_key == "tiktok":
+            source_url = f"https://www.tiktok.com/@i/video/{media_id}"
+        elif plat_key == "twitter":
+            source_url = f"https://x.com/i/status/{media_id}"
+
+    caption = build_media_caption(source_url)
+    title = (cached_entry.title if cached_entry and cached_entry.title else "Audio")
+    performer = plat_key.capitalize()
+
+    # Fast Path 1: Telegram audio file_id already cached in SQLite (instant 0.1s delivery)
+    if cached_entry and cached_entry.telegram_audio_id and callback.message:
+        await callback.answer()
+        try:
+            await callback.message.reply_audio(
+                audio=cached_entry.telegram_audio_id,
+                caption=caption,
+                parse_mode="HTML",
+                title=title,
+                performer=performer,
+                duration=int(cached_entry.duration) if cached_entry.duration else None,
+            )
+            return
+        except Exception as id_err:
+            logger.debug(f"telegram_audio_id re-send failed ({id_err}), falling back to extraction")
+
+    # Check if local video file still exists on disk
+    video_path = Path(cached_entry.file_path) if (cached_entry and cached_entry.file_path) else None
+    has_local_video = video_path is not None and video_path.exists() and video_path.stat().st_size > 0
+
+    if not has_local_video and not source_url:
+        await callback.answer("⚠️ Media source no longer available. Please send the link again.", show_alert=True)
+        return
+
+    await callback.answer("⏳ Processing audio…")
+    status_msg = None
+    if callback.message:
+        try:
+            status_msg = await callback.message.reply("⏳ Extracting audio…")
+        except Exception:
+            pass
+
+    temp_audio_dir: Optional[Path] = None
+    audio_path: Optional[Path] = None
+    try:
+        if has_local_video:
+            # Extract high-quality MP3 from local file via FFmpeg
+            media_cache.acquire_file_use(str(video_path))
+            try:
+                success, audio_path, err = await extract_audio_from_video(
+                    video_path=video_path,
+                    title=title,
+                    artist=performer,
+                )
+            finally:
+                media_cache.release_file_use(str(video_path))
+        else:
+            # Fallback: Download audio stream from URL via yt-dlp + FFmpeg
+            temp_audio_dir = Path(tempfile.mkdtemp(prefix="audio_extract_"))
+            success, audio_path, err = await download_audio_from_url(
+                url=source_url,
+                output_dir=temp_audio_dir,
+            )
+
+        if not success or not audio_path or not audio_path.exists():
+            logger.error(f"Audio extraction failed for {plat_key}:{media_id}: {err}")
+            if status_msg:
+                try:
+                    await status_msg.edit_text("❌ Audio extraction failed. Please try again.")
+                except Exception:
+                    pass
+            return
+
+        record_audio_extraction()
+        short_title = (title[:50] + "...") if len(title) > 55 else title
+        audio_file = FSInputFile(audio_path)
+
+        sent_audio = None
+        if callback.message:
+            try:
+                sent_audio = await callback.message.reply_audio(
+                    audio=audio_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    title=short_title,
+                    performer=performer,
+                    duration=int(cached_entry.duration) if (cached_entry and cached_entry.duration) else None,
+                    request_timeout=300,
+                )
+            except Exception as e1:
+                logger.warning(f"reply_audio failed ({e1}), attempting answer_audio")
+                try:
+                    sent_audio = await callback.message.answer_audio(
+                        audio=audio_file,
+                        caption=caption,
+                        parse_mode="HTML",
+                        title=short_title,
+                        performer=performer,
+                        duration=int(cached_entry.duration) if (cached_entry and cached_entry.duration) else None,
+                        request_timeout=300,
+                    )
+                except Exception as e2:
+                    logger.error(f"answer_audio failed: {e2}")
+
+        # Store telegram_audio_id in SQLite for instant repeat delivery for all users
+        if sent_audio and sent_audio.audio:
+            await media_cache.update_telegram_file_id(
+                platform=plat_key,
+                media_id=media_id,
+                quality=quality,
+                file_id=sent_audio.audio.file_id,
+                is_audio=True,
+            )
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    finally:
+        if temp_audio_dir and temp_audio_dir.exists():
+            cleanup_temp_dir(temp_audio_dir)
+        elif audio_path and not has_local_video and audio_path.exists():
+            try:
+                audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
