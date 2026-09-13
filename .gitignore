@@ -1,0 +1,11 @@
+venv/
+.env
+__pycache__/
+*.pyc
+downloads/
+downloads_temp/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+scratch/
