@@ -3,7 +3,7 @@ import enum
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from config import MAX_CONCURRENT_DOWNLOADS
 
@@ -323,6 +323,58 @@ class JobQueueManager:
             "failed_jobs": failed,
             "cancelled_jobs": cancelled,
         }
+
+    async def shutdown(self) -> None:
+        """
+        Gracefully drains and cancels all active and waiting jobs on SIGTERM/SIGINT.
+        Releases all concurrency slots and guarantees zero phantom jobs remain.
+        """
+        async with self._lock:
+            active_count = len(self._active_jobs)
+            queued_count = len(self._waiting_queue)
+            logger.info(
+                f"🛑 [QUEUE] Initiating graceful shutdown: "
+                f"{active_count} active jobs, {queued_count} queued jobs."
+            )
+
+            # 1. Cancel and unblock all waiting jobs
+            for qid, event in self._waiting_queue:
+                job = self._jobs.get(qid)
+                if job:
+                    job.status = JobStatus.CANCELLED
+                    job.error_message = "Cancelled due to server shutdown (SIGTERM)"
+                    job.completed_at = time.time()
+                event.set()
+            self._waiting_queue.clear()
+
+            # 2. Mark all active jobs as cancelled and release state
+            for jid in list(self._active_jobs):
+                job = self._jobs.get(jid)
+                if job:
+                    job.status = JobStatus.CANCELLED
+                    job.error_message = "Interrupted by server shutdown (SIGTERM)"
+                    job.completed_at = time.time()
+            self._active_jobs.clear()
+            self._user_jobs.clear()
+
+            logger.info(
+                "✅ [QUEUE] Graceful shutdown complete. "
+                "Active=0, Queued=0. Concurrency slots released."
+            )
+
+    def reset_on_startup(self) -> None:
+        """
+        Resets in-memory queue state on fresh startup/restart,
+        guaranteeing zero phantom active jobs or stale queue positions.
+        """
+        self._jobs.clear()
+        self._user_jobs.clear()
+        self._active_jobs.clear()
+        self._waiting_queue.clear()
+        logger.info(
+            f"🔄 [QUEUE] Queue state initialized for startup. "
+            f"Max concurrent slots: {self.max_concurrent}"
+        )
 
 
 # Global Job Queue Manager

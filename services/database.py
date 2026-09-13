@@ -693,6 +693,25 @@ class DatabaseManager:
     async def cleanup(self, max_bytes: int, active_files: set[str], retention_seconds: int = 86400 * 3) -> int:
         return await asyncio.to_thread(self._cleanup_sync, max_bytes, active_files, retention_seconds)
 
+    def _shutdown_sync(self) -> None:
+        if not self.db_path.exists():
+            return
+        try:
+            with self._get_connection() as conn:
+                # Flush WAL journal pages back to main database file
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.execute("PRAGMA optimize;")
+            logger.info(f"✅ [DATABASE] SQLite WAL checkpointed and closed cleanly ({self.db_path.name}).")
+        except Exception as e:
+            logger.warning(f"⚠️ [DATABASE] Error during database shutdown checkpoint: {e}")
+
+    async def shutdown(self) -> None:
+        """Flushes SQLite WAL to disk and closes cleanly on shutdown."""
+        if not self._initialized:
+            return
+        async with self._lock:
+            await asyncio.to_thread(self._shutdown_sync)
+
 
 # Global Database Instance
 db = DatabaseManager()

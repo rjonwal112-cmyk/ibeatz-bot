@@ -128,8 +128,10 @@ yt_dlp.YoutubeDL.process_ie_result = _hooked_process_ie_result
 # Global concurrency semaphore to protect CPU and bandwidth
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# Active cancellation registry: req_id -> bool
+# Active cancellation and shutdown tracking
 CANCELLED_REQUESTS: set[str] = set()
+SHUTDOWN_REQUESTED: bool = False
+ACTIVE_TEMP_DIRS: set[Path] = set()
 
 # Regex to detect URLs in user text
 URL_REGEX = re.compile(r"https?://[^\s<>\"'{}|\\^`\[\]]+", re.IGNORECASE)
@@ -223,16 +225,62 @@ def format_duration(seconds: Optional[int]) -> str:
 
 def cleanup_temp_dir(temp_dir: Optional[Path]) -> None:
     """Removes a temporary user download directory."""
-    if temp_dir and temp_dir.exists():
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup temp dir {temp_dir}: {e}")
+    if temp_dir:
+        ACTIVE_TEMP_DIRS.discard(temp_dir)
+        if temp_dir.exists():
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp dir {temp_dir}: {e}")
 
 
 def cancel_download(req_id: str) -> None:
     """Registers cancellation for an active download request."""
     CANCELLED_REQUESTS.add(req_id)
+
+
+def cancel_all_active_downloads() -> int:
+    """Signals cancellation to all running download threads during process shutdown."""
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+    count = len(ACTIVE_TEMP_DIRS)
+    logger.info(f"🛑 [DOWNLOADER] Global cancellation triggered for {count} active temp dirs.")
+    return count
+
+
+def cleanup_orphaned_temp_dirs(retention_seconds: int = 0) -> int:
+    """
+    Scans BASE_DOWNLOAD_DIR and safely purges stale 'user_*' download directories.
+    Preserves cache/ and database files.
+    Invoked on startup to scrub leftovers from previous abrupt restarts/SIGTERMs, and on shutdown.
+    """
+    if not BASE_DOWNLOAD_DIR.exists():
+        return 0
+
+    removed_count = 0
+    now = time.time()
+    try:
+        for item in BASE_DOWNLOAD_DIR.iterdir():
+            if item.is_dir() and item.name.startswith("user_"):
+                if retention_seconds > 0:
+                    try:
+                        mtime = item.stat().st_mtime
+                        if now - mtime < retention_seconds:
+                            continue
+                    except Exception:
+                        pass
+                try:
+                    ACTIVE_TEMP_DIRS.discard(item)
+                    shutil.rmtree(item, ignore_errors=True)
+                    removed_count += 1
+                except Exception as rm_err:
+                    logger.warning(f"Failed to remove orphaned temp dir {item}: {rm_err}")
+    except Exception as e:
+        logger.warning(f"Error scanning for orphaned temp dirs: {e}")
+
+    if removed_count > 0:
+        logger.info(f"🧹 [DOWNLOADER] Cleaned up {removed_count} orphaned temporary directories.")
+    return removed_count
 
 
 def _is_video_format(f: dict) -> bool:
@@ -860,6 +908,7 @@ def _sync_download(
     unique_id = uuid.uuid4().hex[:8]
     temp_dir = BASE_DOWNLOAD_DIR / f"user_{user_id}_{timestamp}_{unique_id}"
     temp_dir.mkdir(parents=True, exist_ok=True)
+    ACTIVE_TEMP_DIRS.add(temp_dir)
 
     record_download_start()
 
@@ -1104,8 +1153,8 @@ def _sync_download(
     last_update_time = [0.0]
 
     def _progress_hook(d: dict) -> None:
-        if req_id and req_id in CANCELLED_REQUESTS:
-            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user")
+        if SHUTDOWN_REQUESTED or (req_id and req_id in CANCELLED_REQUESTS):
+            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user or shutdown")
 
         if d.get("status") == "downloading" and progress_callback:
             now = time.time()
@@ -1123,8 +1172,8 @@ def _sync_download(
     pp_start_time = [0.0]
 
     def _pp_hook(d: dict) -> None:
-        if req_id and req_id in CANCELLED_REQUESTS:
-            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user")
+        if SHUTDOWN_REQUESTED or (req_id and req_id in CANCELLED_REQUESTS):
+            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user or shutdown")
 
         if d.get("status") == "started":
             pp_start_time[0] = time.time()
