@@ -447,26 +447,20 @@ def _build_format_options(
     plat_key = getattr(platform_info, "key", "").lower()
 
     # Instagram & Facebook: Highest available quality
-    # Formats 1, 2, 3 (Instagram) and hd, sd (Facebook) are direct progressive MP4s
-    # containing both video and audio. Prioritizing them avoids downloading separate streams
-    # and completely eliminates FFmpeg remuxing overhead!
-    # Instagram & Facebook: Highest available progressive streams
+    # Prioritize progressive streams with audio, or merge with AAC audio
     if plat_key in ("instagram", "facebook"):
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
-                "1/2/3/sd/hd/"
-                "best[ext=mp4]/"
                 "best[ext=mp4][acodec!=none]/"
                 "best[acodec!=none]/"
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/"
                 "best"
             )
         else:
             format_spec = (
-                "1/2/3/sd/hd/"
-                "best[ext=mp4]/"
                 "best[ext=mp4][acodec!=none]/"
                 "best[acodec!=none]/"
                 "best"
@@ -474,30 +468,31 @@ def _build_format_options(
         return format_spec, postprocessors, merge_output_format
 
     # YouTube and generic platforms for 'highest' / 'best':
-    # Prioritize progressive formats 22 (720p) & 18 (360p) for instant single-pass delivery,
-    # and cap at 720p/1080p to stay under Telegram's 50MB file size limit.
+    # Cap at 1080p and guarantee audio stream is always included and merged
     if quality in (QUALITY_HIGHEST, QUALITY_BEST):
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
                 "22/18/"
+                "best[height<=1080][ext=mp4][acodec!=none]/"
+                "best[height<=1080][acodec!=none]/"
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080]+bestaudio/"
+                "bestvideo+bestaudio/"
                 "best[height<=720][ext=mp4][acodec!=none]/"
                 "best[height<=720][acodec!=none]/"
-                "best[height<=1080][ext=mp4][acodec!=none]/"
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=720]+bestaudio/"
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=1080]+bestaudio/"
-                "best[height<=720]/"
-                "best[height<=1080]/"
+                "best[acodec!=none]/"
                 "best"
             )
         else:
             format_spec = (
                 "22/18/"
+                "best[height<=1080][ext=mp4][acodec!=none]/"
+                "best[height<=1080][acodec!=none]/"
                 "best[height<=720][ext=mp4][acodec!=none]/"
                 "best[height<=720][acodec!=none]/"
-                "best[height<=1080][ext=mp4][acodec!=none]/"
+                "best[acodec!=none]/"
                 "best"
             )
         return format_spec, postprocessors, merge_output_format
@@ -508,8 +503,6 @@ def _build_format_options(
     h_min = max(1, h_val - 120)
 
     if h_val <= 720:
-        # For <= 720p, prioritize format 22 (720p progressive MP4) and format 18 (360p progressive MP4)
-        # to download video + audio in ONE single pass with ZERO FFmpeg merge latency!
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
@@ -520,7 +513,9 @@ def _build_format_options(
                 f"best[height<={h_val}][acodec!=none]/"
                 f"bestvideo[height<={h_val}][height>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[width<={h_val}][width>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h_val}]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={h_val}]+bestaudio/"
+                f"best[acodec!=none]/"
                 f"best"
             )
         else:
@@ -530,6 +525,7 @@ def _build_format_options(
                 f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
                 f"best[height<={h_val}][acodec!=none]/"
                 f"best[width<={h_val}][acodec!=none]/"
+                f"best[acodec!=none]/"
                 f"best"
             )
     else:
@@ -539,28 +535,25 @@ def _build_format_options(
             format_spec = (
                 f"bestvideo[height<={h_val}][height>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[width<={h_val}][width>{h_min}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h_val}][height>{h_min}]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={h_val}][height>{h_min}]+bestaudio/"
-                f"bestvideo[width<={h_val}]+bestaudio/"
+                f"bestvideo[height<={h_val}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h_val}]+bestaudio/"
+                f"bestvideo+bestaudio/"
                 f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
-                f"bestvideo[height<={h_val}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[width<={h_val}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={h_val}]+bestaudio/"
-                f"bestvideo[width<={h_val}]+bestaudio/"
-                f"best[height<={h_val}][ext=mp4]/"
-                f"best[width<={h_val}][ext=mp4]/"
-                f"best[height<={h_val}]/"
-                f"best[width<={h_val}]/"
+                f"best[height<={h_val}][ext=mp4][acodec!=none]/"
+                f"best[height<={h_val}][acodec!=none]/"
+                f"best[acodec!=none]/"
                 f"best"
             )
         else:
             format_spec = (
                 f"best[height<={h_val}][height>{h_min}][ext=mp4][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][ext=mp4][acodec!=none]/"
+                f"best[height<={h_val}][ext=mp4][acodec!=none]/"
                 f"best[height<={h_val}][acodec!=none]/"
-                f"best[width<={h_val}][acodec!=none]/"
-                f"best[height<={h_val}]/"
-                f"best[width<={h_val}]/"
+                f"best[acodec!=none]/"
                 f"best"
             )
 
@@ -961,8 +954,10 @@ def _sync_download(
 
                     if not downloaded_ok:
                         v_ydl_opts = {
-                            "format": "best[ext=mp4]/best",
+                            "format": "best[ext=mp4][acodec!=none]/best[acodec!=none]/bestvideo+bestaudio/best",
                             "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
+                            "merge_output_format": "mp4",
+                            "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
                             "quiet": True,
                             "no_warnings": True,
                             "socket_timeout": 20,
@@ -1207,7 +1202,8 @@ def _sync_download(
 
     if merge_format:
         ydl_opts["merge_output_format"] = merge_format
-        ydl_opts["postprocessor_args"] = {"merger": ["-c", "copy"]}
+        # Lossless video copy (-c:v copy) + standard AAC audio (-c:a aac) for universal Telegram sound compatibility
+        ydl_opts["postprocessor_args"] = {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]}
 
     if postprocessors:
         ydl_opts["postprocessors"] = postprocessors

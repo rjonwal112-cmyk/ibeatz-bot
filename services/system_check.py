@@ -54,6 +54,19 @@ def resolve_ffmpeg_path() -> Optional[str]:
                 _CACHED_FFMPEG_PATH = str(exe)
                 return _CACHED_FFMPEG_PATH
 
+    # Search imageio_ffmpeg fallback (bundled static FFmpeg binary for Linux/Render/Windows)
+    try:
+        import imageio_ffmpeg
+        img_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if img_exe and os.path.isfile(img_exe):
+            bin_dir = str(Path(img_exe).parent)
+            if bin_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+            _CACHED_FFMPEG_PATH = str(img_exe)
+            return _CACHED_FFMPEG_PATH
+    except Exception:
+        pass
+
     return shutil.which("ffmpeg")
 
 
