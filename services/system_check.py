@@ -60,9 +60,23 @@ def resolve_ffmpeg_path() -> Optional[str]:
         img_exe = imageio_ffmpeg.get_ffmpeg_exe()
         if img_exe and os.path.isfile(img_exe):
             bin_dir = str(Path(img_exe).parent)
+            standard_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+            standard_path = Path(img_exe).parent / standard_name
+            if not standard_path.exists():
+                try:
+                    os.symlink(img_exe, standard_path)
+                except Exception:
+                    try:
+                        shutil.copy2(img_exe, standard_path)
+                        if os.name != "nt":
+                            os.chmod(standard_path, 0o755)
+                    except Exception as copy_err:
+                        logger.debug(f"Failed to copy imageio_ffmpeg binary to {standard_name}: {copy_err}")
+            
+            chosen_exe = str(standard_path) if standard_path.exists() else str(img_exe)
             if bin_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
-            _CACHED_FFMPEG_PATH = str(img_exe)
+            _CACHED_FFMPEG_PATH = chosen_exe
             return _CACHED_FFMPEG_PATH
     except Exception:
         pass

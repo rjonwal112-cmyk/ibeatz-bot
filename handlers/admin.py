@@ -6,6 +6,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import config
 from config import ADMIN_IDS
 from services.cache import media_cache
 from services.database import db
@@ -24,7 +25,7 @@ print("ADMIN ROUTER LOADED")
 
 def is_admin(user_id: int) -> bool:
     """Checks if the given user is authorized as an administrator."""
-    return user_id in ADMIN_IDS and user_id != 0
+    return user_id in config.ADMIN_IDS and user_id != 0
 
 
 def _build_admin_keyboard() -> Any:
@@ -239,7 +240,7 @@ async def admin_maintenance_handler(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else 0
     if not is_admin(user_id):
         chat_id = message.chat.id if getattr(message, "chat", None) else None
-        logger.warning(f"Unauthorized /maintenance attempt from user_id={user_id}, chat_id={chat_id}, ADMIN_IDS={ADMIN_IDS}")
+        logger.warning(f"Unauthorized /maintenance attempt user_id={user_id} chat_id={chat_id}")
         await message.reply("⛔ This command is restricted to bot administrators.")
         return
 
@@ -271,7 +272,8 @@ async def maintenance_callback_handler(callback: CallbackQuery) -> None:
     """Handles maintenance inline keyboard actions (Admin only)."""
     user_id = callback.from_user.id
     if not is_admin(user_id):
-        logger.warning(f"Unauthorized maintenance callback from user_id={user_id}, ADMIN_IDS={ADMIN_IDS}")
+        chat_id = callback.message.chat.id if callback.message and getattr(callback.message, "chat", None) else None
+        logger.warning(f"Unauthorized /maintenance attempt user_id={user_id} chat_id={chat_id}")
         await callback.answer("⛔ Unauthorized: Admin access required.", show_alert=True)
         return
 

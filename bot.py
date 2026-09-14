@@ -352,8 +352,10 @@ async def main() -> None:
     # Print comprehensive process and runtime diagnostics
     registered_router_names = [r.name for r in dp.sub_routers]
     registered_command_names = [f"/{c.command}" for c in user_commands]
+    logger.info(f"ADMIN_IDS loaded: {sorted(list(ADMIN_IDS))}")
     print("=" * 60)
     print("RUNTIME PROCESS & ENVIRONMENT DIAGNOSTICS:")
+    print(f"  • ADMIN_IDS loaded:   {sorted(list(ADMIN_IDS))}")
     print(f"  • Python Executable:  {sys.executable}")
     print(f"  • Working Directory:  {os.getcwd()}")
     print(f"  • Project Root Path:  {Path(__file__).resolve().parent}")

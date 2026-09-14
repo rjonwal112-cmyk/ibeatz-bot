@@ -232,11 +232,14 @@ async def _deliver_cached_media(
 
     if not is_photo and file_path and file_path.exists():
         norm_probe = probe_media_detailed(file_path)
-        if not norm_probe.get("is_ios_compatible") and file_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-            file_path, norm_probe = normalize_video_for_ios(
-                file_path,
-                source_has_audio=norm_probe.get("has_audio", True),
-            )
+        if not file_path.name.endswith("_ios.mp4") and not norm_probe.get("is_ios_compatible") and file_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+            try:
+                file_path, norm_probe = normalize_video_for_ios(
+                    file_path,
+                    source_has_audio=norm_probe.get("has_audio", True),
+                )
+            except Exception as cache_norm_err:
+                logger.error(f"Cached video normalization failed: {cache_norm_err}")
         v_codec = norm_probe.get("video_codec") or "unknown"
         a_codec = norm_probe.get("audio_codec") or ("none" if not norm_probe.get("has_audio") else "unknown")
         cont = norm_probe.get("container") or "unknown"
@@ -565,16 +568,19 @@ async def _download_and_deliver(
                             media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
                         else:
                             norm_probe = probe_media_detailed(ipath)
-                            if not norm_probe.get("is_ios_compatible") and ipath.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                            if not ipath.name.endswith("_ios.mp4") and not norm_probe.get("is_ios_compatible") and ipath.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
                                 if status_msg:
                                     try:
                                         await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
                                     except Exception:
                                         pass
-                                ipath, norm_probe = normalize_video_for_ios(
-                                    ipath,
-                                    source_has_audio=norm_probe.get("has_audio", True),
-                                )
+                                try:
+                                    ipath, norm_probe = normalize_video_for_ios(
+                                        ipath,
+                                        source_has_audio=norm_probe.get("has_audio", True),
+                                    )
+                                except Exception as c_norm_err:
+                                    logger.error(f"Carousel item normalization error: {c_norm_err}")
                             v_codec = norm_probe.get("video_codec") or "unknown"
                             a_codec = norm_probe.get("audio_codec") or ("none" if not norm_probe.get("has_audio") else "unknown")
                             cont = norm_probe.get("container") or "unknown"
@@ -707,16 +713,30 @@ async def _download_and_deliver(
                 # Validation and normalization before Telegram upload using ffprobe
                 source_has_audio = getattr(info, "has_audio", True) if info else True
                 norm_probe = probe_media_detailed(upload_path)
-                if not norm_probe.get("is_ios_compatible") and upload_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                is_already_norm = bool(getattr(result, "is_normalized", False) or upload_path.name.endswith("_ios.mp4"))
+                if not is_already_norm and not norm_probe.get("is_ios_compatible") and upload_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
                     if status_msg:
                         try:
                             await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
                         except Exception:
                             pass
-                    upload_path, norm_probe = normalize_video_for_ios(
-                        upload_path,
-                        source_has_audio=source_has_audio,
-                    )
+                    try:
+                        upload_path, norm_probe = normalize_video_for_ios(
+                            upload_path,
+                            source_has_audio=source_has_audio,
+                        )
+                        result.is_normalized = True
+                    except Exception as norm_err:
+                        logger.error(f"Post-download normalization failed: {norm_err}")
+                        job_queue.finish_job(req_id, success=False, error=str(norm_err))
+                        async with IN_FLIGHT_LOCK:
+                            if flight_future and not flight_future.done():
+                                flight_future.set_result(None)
+                            IN_FLIGHT_DOWNLOADS.pop(flight_key, None)
+                        if status_msg:
+                            await status_msg.edit_text("❌ Video processing failed or timed out. Please try again.")
+                        return
+
                     media_file = FSInputFile(upload_path, chunk_size=524288)
                     result.file_path = upload_path
 

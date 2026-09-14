@@ -221,6 +221,7 @@ class DownloadResult:
     timings: DownloadTimings = field(default_factory=DownloadTimings)
     is_carousel: bool = False
     carousel_files: list[tuple[str, Path]] = field(default_factory=list)
+    is_normalized: bool = False
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -1111,7 +1112,7 @@ def probe_media_detailed(file_path: Optional[Path]) -> dict:
             cmd = [
                 ffprobe_bin,
                 "-v", "error",
-                "-show_entries", "stream=index,codec_type,codec_name,width,height:format=format_name",
+                "-show_entries", "stream=index,codec_type,codec_name,width,height,pix_fmt,channels:format=format_name",
                 "-of", "json",
                 str(file_path),
             ]
@@ -1146,7 +1147,7 @@ def probe_media_detailed(file_path: Optional[Path]) -> dict:
             output = res.stderr.lower()
             info["has_video"] = "video:" in output or ("stream #0:" in output and "video" in output)
             info["has_audio"] = "audio:" in output or ("stream #0:" in output and "audio" in output)
-            if "h264" in output:
+            if "h264" in output or "avc1" in output:
                 info["video_codec"] = "h264"
             elif "vp9" in output:
                 info["video_codec"] = "vp9"
@@ -1156,6 +1157,12 @@ def probe_media_detailed(file_path: Optional[Path]) -> dict:
                 info["audio_codec"] = "aac"
             elif "opus" in output:
                 info["audio_codec"] = "opus"
+            if "yuv420p" in output:
+                info["pix_fmt"] = "yuv420p"
+            if "stereo" in output or "2 channels" in output:
+                info["channels"] = 2
+            elif "mono" in output or "1 channels" in output:
+                info["channels"] = 1
         except Exception:
             pass
 
@@ -1175,11 +1182,88 @@ def is_ios_compatible(probe_info: dict) -> bool:
     """
     if not probe_info:
         return False
-    v_ok = bool(probe_info.get("has_video") and probe_info.get("video_codec") in ("h264", "avc1") and probe_info.get("pix_fmt") in ("yuv420p", None))
-    a_ok = bool(not probe_info.get("has_audio") or (probe_info.get("audio_codec") == "aac" and (probe_info.get("channels") is None or probe_info.get("channels") <= 2)))
+    v_ok = bool(
+        probe_info.get("has_video")
+        and probe_info.get("video_codec") in ("h264", "avc1")
+        and probe_info.get("pix_fmt") in ("yuv420p", None)
+    )
+    a_ok = bool(
+        not probe_info.get("has_audio")
+        or (
+            probe_info.get("audio_codec") == "aac"
+            and (probe_info.get("channels") is None or probe_info.get("channels") <= 2)
+        )
+    )
     cont = str(probe_info.get("container") or "")
     c_ok = bool("mp4" in cont.lower())
     return bool(v_ok and a_ok and c_ok)
+
+
+class RemuxError(Exception):
+    """Raised when FFmpeg remuxing or transcoding fails or times out."""
+    pass
+
+
+def _run_ffmpeg_remux(
+    cmd: list[str],
+    timeout_s: float,
+    norm_file: Path,
+) -> tuple[int, Optional[int], Optional[str]]:
+    """
+    Executes FFmpeg with hard timeout, safe process termination (proc.kill()),
+    and temp file cleanup on error/timeout.
+    Returns: (returncode, pid, error_message)
+    """
+    if norm_file.exists():
+        try:
+            norm_file.unlink()
+        except Exception:
+            pass
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    pid = proc.pid
+    logger.info(f"[REMUX DEBUG] ffmpeg_started=True")
+    logger.info(f"[REMUX DEBUG] ffmpeg_pid={pid}")
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        retcode = proc.returncode
+        err_msg = stderr.strip() if retcode != 0 else None
+        return retcode, pid, err_msg
+    except subprocess.TimeoutExpired:
+        logger.error(f"[REMUX DEBUG] ffmpeg_error=TimeoutExpired after {timeout_s}s (pid={pid})")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if norm_file.exists():
+            try:
+                norm_file.unlink()
+            except Exception:
+                pass
+        return -1, pid, f"FFmpeg execution timed out after {timeout_s}s"
+    except Exception as run_err:
+        logger.error(f"[REMUX DEBUG] ffmpeg_error={run_err}")
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if norm_file.exists():
+            try:
+                norm_file.unlink()
+            except Exception:
+                pass
+        return -1, pid, str(run_err)
 
 
 def normalize_video_for_ios(
@@ -1189,12 +1273,11 @@ def normalize_video_for_ios(
     audio_path: Optional[Path] = None,
 ) -> tuple[Path, dict]:
     """
-    Normalizes any video file to an iOS-compatible MP4 container (H.264 + AAC) with faststart.
-    - If already iOS-compatible (H.264 + AAC MP4) and no separate audio needed: stream-copy / remux with faststart.
-    - If video is VP9/AV1/etc. or audio is not AAC: transcode via FFmpeg (libx264 + aac).
-    - When separate streams: -map 0:v:0 -map 1:a:0.
-    - When single input has both streams: -map 0:v:0 -map 0:a:0.
-    - When source has no audio: -map 0:v:0.
+    Normalizes video file to an iOS-compatible MP4 container (H.264 + AAC).
+    - If already iOS-compatible: stream-copy / remux with faststart (-c copy -movflags +faststart).
+    - Transcoding is ONLY performed when strictly necessary for iOS compatibility.
+    - NEVER normalizes the same file twice.
+    - Enforces hard timeout with safe process kill, temp cleanup, and clear error logging.
     Returns: (final_file_path, probe_info)
     """
     if not file_path or not file_path.exists():
@@ -1206,28 +1289,39 @@ def normalize_video_for_ios(
         return file_path, probe_media_detailed(file_path)
 
     probe = probe_media_detailed(file_path)
+    input_vcodec = probe.get("video_codec") or "unknown"
+    input_acodec = probe.get("audio_codec") or ("none" if not probe.get("has_audio") else "unknown")
     has_input_audio = bool(probe.get("has_audio"))
     has_separate_audio = bool(audio_path and audio_path.exists() and audio_path.stat().st_size > 0)
     needs_audio = bool(source_has_audio and (has_input_audio or has_separate_audio))
 
-    logger.info(
-        f"[iOS COMPATIBILITY CHECK] input={file_path.name}, vcodec={probe.get('video_codec')}, "
-        f"acodec={probe.get('audio_codec')}, container={probe.get('container')}, "
-        f"is_ios_compatible={probe.get('is_ios_compatible')}, separate_audio={has_separate_audio}"
-    )
+    logger.info(f"[REMUX DEBUG] input={file_path.name}")
+    logger.info(f"[REMUX DEBUG] input_codec={input_vcodec}")
+    logger.info(f"[REMUX DEBUG] input_audio={input_acodec}")
 
-    # Determine destination directory and target output path
+    # A. NEVER normalize/remux the same file twice
+    if not has_separate_audio and file_path.name.endswith("_ios.mp4"):
+        logger.info(f"[REMUX DEBUG] normalization_required=False")
+        logger.info(f"[REMUX DEBUG] ffmpeg_command=none")
+        logger.info(f"[REMUX DEBUG] ffmpeg_started=False")
+        logger.info(f"[REMUX DEBUG] ffmpeg_pid=None")
+        logger.info(f"[REMUX DEBUG] ffmpeg_returncode=0")
+        logger.info(f"[REMUX DEBUG] ffmpeg_error=None")
+        logger.info(f"[REMUX DEBUG] output_exists={file_path.exists()}")
+        logger.info(f"[REMUX DEBUG] output_size={file_path.stat().st_size if file_path.exists() else 0}")
+        logger.info(f"[REMUX DEBUG] final_video={input_vcodec}")
+        logger.info(f"[REMUX DEBUG] final_audio={input_acodec}")
+        return file_path, probe
+
     target_dir = temp_dir or file_path.parent
     norm_file = target_dir / f"{file_path.stem}_ios.mp4"
 
-    # Prevent duplicate normalization if file is already an iOS-normalized file
-    if not has_separate_audio and file_path.name.endswith("_ios.mp4") and probe.get("is_ios_compatible"):
-        logger.info(f"File {file_path.name} is already normalized for iOS, skipping duplicate normalization.")
-        return file_path, probe
+    is_compat = bool(probe.get("is_ios_compatible", False))
+    is_mp4 = bool(file_path.suffix.lower() == ".mp4")
 
-    # Case 1: Already H.264 + AAC MP4 and no separate audio merge required -> Stream copy / remux with faststart
-    if not has_separate_audio and probe.get("is_ios_compatible") and file_path.suffix.lower() == ".mp4":
-        logger.info(f"File {file_path.name} is already iOS-compatible (H.264 + AAC MP4). Remuxing with faststart...")
+    # Case 1: Already H.264 + AAC + yuv420p + <=2 channels in MP4 -> Stream copy / fast remux ONLY
+    if not has_separate_audio and is_compat and is_mp4:
+        logger.info(f"[REMUX DEBUG] normalization_required=False")
         cmd = [
             ffmpeg_bin, "-y",
             "-i", str(file_path),
@@ -1237,17 +1331,30 @@ def normalize_video_for_ios(
             cmd.extend(["-map", "0:a:0"])
         cmd.extend(["-c", "copy", "-movflags", "+faststart", str(norm_file)])
 
-        remux_res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if remux_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
+        logger.info(f"[REMUX DEBUG] ffmpeg_command={' '.join(cmd)}")
+        retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=30, norm_file=norm_file)
+        logger.info(f"[REMUX DEBUG] ffmpeg_returncode={retcode}")
+        logger.info(f"[REMUX DEBUG] ffmpeg_error={err_msg}")
+
+        out_exists = norm_file.exists() and norm_file.stat().st_size > 0
+        out_size = norm_file.stat().st_size if out_exists else 0
+        logger.info(f"[REMUX DEBUG] output_exists={out_exists}")
+        logger.info(f"[REMUX DEBUG] output_size={out_size}")
+
+        if retcode == 0 and out_exists:
             final_probe = probe_media_detailed(norm_file)
+            final_v = final_probe.get("video_codec") or "unknown"
+            final_a = final_probe.get("audio_codec") or ("none" if not final_probe.get("has_audio") else "unknown")
+            logger.info(f"[REMUX DEBUG] final_video={final_v}")
+            logger.info(f"[REMUX DEBUG] final_audio={final_a}")
             if not needs_audio or final_probe.get("has_audio"):
                 return norm_file, final_probe
-            logger.warning(f"Fast remux lost audio ({remux_res.stderr}), falling back to transcode")
+            logger.warning(f"Fast remux lost audio ({err_msg}), falling back to transcode")
         else:
-            logger.warning(f"Fast remux failed ({remux_res.stderr}), proceeding to transcode")
+            logger.warning(f"Fast remux failed (ret={retcode}, err={err_msg}), falling back to transcode")
 
-    # Case 2: Transcode / Merge incompatible video or separate audio streams
-    logger.info(f"Normalizing video {file_path.name} (codec={probe.get('video_codec')}) to H.264 + AAC MP4 for iOS...")
+    # Case 2: Transcode / Merge incompatible video or audio streams
+    logger.info(f"[REMUX DEBUG] normalization_required=True")
     cmd = [
         ffmpeg_bin, "-y",
         "-i", str(file_path),
@@ -1261,8 +1368,8 @@ def normalize_video_for_ios(
         if has_input_audio:
             cmd.extend(["-map", "0:a:0"])
 
-    # Video: stream copy ONLY if already h264/avc1 with standard 8-bit yuv420p in mp4, else libx264 with yuv420p
-    if not has_separate_audio and probe.get("video_codec") in ("h264", "avc1") and probe.get("pix_fmt") == "yuv420p" and file_path.suffix.lower() == ".mp4":
+    # Video: stream copy ONLY if already h264/avc1 with yuv420p in mp4, else libx264
+    if not has_separate_audio and input_vcodec in ("h264", "avc1") and probe.get("pix_fmt") in ("yuv420p", None) and is_mp4:
         cmd.extend(["-c:v", "copy"])
     else:
         cmd.extend([
@@ -1272,7 +1379,7 @@ def normalize_video_for_ios(
             "-pix_fmt", "yuv420p",
         ])
 
-    # Audio: preserve/copy if already stereo/mono AAC, otherwise encode to AAC stereo at 192k
+    # Audio: preserve/copy if already AAC stereo/mono, otherwise transcode to AAC stereo
     if has_separate_audio or has_input_audio:
         a_probe = probe if not has_separate_audio else probe_media_detailed(audio_path)
         a_codec = a_probe.get("audio_codec")
@@ -1284,17 +1391,33 @@ def normalize_video_for_ios(
 
     cmd.extend(["-movflags", "+faststart", str(norm_file)])
 
-    tc_res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if tc_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
+    logger.info(f"[REMUX DEBUG] ffmpeg_command={' '.join(cmd)}")
+    retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=75, norm_file=norm_file)
+    logger.info(f"[REMUX DEBUG] ffmpeg_returncode={retcode}")
+    logger.info(f"[REMUX DEBUG] ffmpeg_error={err_msg}")
+
+    out_exists = norm_file.exists() and norm_file.stat().st_size > 0
+    out_size = norm_file.stat().st_size if out_exists else 0
+    logger.info(f"[REMUX DEBUG] output_exists={out_exists}")
+    logger.info(f"[REMUX DEBUG] output_size={out_size}")
+
+    if retcode == 0 and out_exists:
         final_probe = probe_media_detailed(norm_file)
-        if (has_input_audio or has_separate_audio) and not final_probe.get("has_audio"):
-            logger.error(f"iOS normalization dropped audio stream for {file_path.name}! Reverting to original file.")
-            return file_path, probe
-        logger.info(f"Successfully normalized {file_path.name} to iOS MP4 ({norm_file.name}, size={norm_file.stat().st_size})")
+        final_v = final_probe.get("video_codec") or "unknown"
+        final_a = final_probe.get("audio_codec") or ("none" if not final_probe.get("has_audio") else "unknown")
+        logger.info(f"[REMUX DEBUG] final_video={final_v}")
+        logger.info(f"[REMUX DEBUG] final_audio={final_a}")
+        if needs_audio and not final_probe.get("has_audio"):
+            logger.error(f"iOS normalization dropped audio stream for {file_path.name}!")
+            if norm_file.exists():
+                norm_file.unlink()
+            raise RemuxError("Normalization dropped required audio stream")
         return norm_file, final_probe
     else:
-        logger.error(f"FFmpeg iOS normalization failed: {tc_res.stderr}")
-        return file_path, probe
+        logger.error(f"FFmpeg iOS normalization failed: {err_msg}")
+        if norm_file.exists():
+            norm_file.unlink()
+        raise RemuxError(f"FFmpeg normalization failed: {err_msg}")
 
 
 
@@ -2457,11 +2580,22 @@ def _sync_download(
 
             # Normalize video for iOS compatibility (H.264/AVC + AAC + MP4 + faststart)
             if not is_audio_file and downloaded_file.exists():
-                downloaded_file, norm_probe = normalize_video_for_ios(
-                    downloaded_file,
-                    source_has_audio=source_has_audio,
-                    temp_dir=temp_dir,
-                )
+                try:
+                    downloaded_file, norm_probe = normalize_video_for_ios(
+                        downloaded_file,
+                        source_has_audio=source_has_audio,
+                        temp_dir=temp_dir,
+                    )
+                except Exception as norm_err:
+                    record_download_finish(success=False)
+                    logger.error(f"Video normalization error: {norm_err}", exc_info=True)
+                    return DownloadResult(
+                        success=False,
+                        media_info=media_info,
+                        error_code="REMUX_FAILED",
+                        error_message="❌ Video processing failed or timed out. Please try a lower resolution or another link.",
+                        temp_dir=temp_dir,
+                    )
                 file_size = downloaded_file.stat().st_size
                 ext = downloaded_file.suffix.lower()
                 has_v_stream = norm_probe.get("has_video", False)
@@ -2645,6 +2779,7 @@ def _sync_download(
                 temp_dir=temp_dir,
                 is_audio=is_audio_file,
                 timings=timings,
+                is_normalized=not is_audio_file,
             )
 
     except yt_dlp.utils.DownloadCancelled:

@@ -11,8 +11,8 @@ load_dotenv(override=True)
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 
-# Support multiple admin IDs (comma-separated or single) via ADMIN_IDS or ADMIN_ID
-_raw_admin = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "0").strip()
+# Support multiple admin IDs via ADMIN_IDS or ADMIN_ID (comma-separated, semicolon-separated, or single ID)
+_raw_admin = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "0").strip().strip("'\"[]")
 _ADMIN_RAW = _raw_admin.replace(";", ",").split(",")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _ADMIN_RAW if x.strip().isdigit()}
 ADMIN_ID: int = next(iter(ADMIN_IDS), 0)
