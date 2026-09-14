@@ -27,6 +27,7 @@ except ImportError:
 
 from config import (
     BASE_DOWNLOAD_DIR,
+    DOWNLOAD_TIMEOUT_SECONDS,
     MAX_CONCURRENT_DOWNLOADS,
     MAX_FILE_SIZE_BYTES,
     PROGRESS_UPDATE_INTERVAL_SECONDS,
@@ -156,6 +157,7 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 CANCELLED_REQUESTS: set[str] = set()
 SHUTDOWN_REQUESTED: bool = False
 ACTIVE_TEMP_DIRS: set[Path] = set()
+ACTIVE_SUBPROCESSES: dict[str, set[subprocess.Popen]] = {}
 
 # Regex to detect URLs in user text
 URL_REGEX = re.compile(r"https?://[^\s<>\"'{}|\\^`\[\]]+", re.IGNORECASE)
@@ -260,8 +262,17 @@ def cleanup_temp_dir(temp_dir: Optional[Path]) -> None:
 
 
 def cancel_download(req_id: str) -> None:
-    """Registers cancellation for an active download request."""
+    """Registers cancellation for an active download request and terminates running child processes."""
+    if not req_id:
+        return
     CANCELLED_REQUESTS.add(req_id)
+    procs = ACTIVE_SUBPROCESSES.pop(req_id, None)
+    if procs:
+        for p in list(procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
 
 
 def cancel_all_active_downloads() -> int:
@@ -269,6 +280,13 @@ def cancel_all_active_downloads() -> int:
     global SHUTDOWN_REQUESTED
     SHUTDOWN_REQUESTED = True
     count = len(ACTIVE_TEMP_DIRS)
+    for req_id, procs in list(ACTIVE_SUBPROCESSES.items()):
+        for p in list(procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
+    ACTIVE_SUBPROCESSES.clear()
     logger.info(f"🛑 [DOWNLOADER] Global cancellation triggered for {count} active temp dirs.")
     return count
 
@@ -1208,6 +1226,7 @@ def _run_ffmpeg_remux(
     cmd: list[str],
     timeout_s: float,
     norm_file: Path,
+    req_id: Optional[str] = None,
 ) -> tuple[int, Optional[int], Optional[str]]:
     """
     Executes FFmpeg with hard timeout, safe process termination (proc.kill()),
@@ -1220,6 +1239,8 @@ def _run_ffmpeg_remux(
         except Exception:
             pass
 
+    t_start = time.time()
+    logger.info(f"[VIDEO TRACE] request_id={req_id or 'unknown'} ffmpeg_start cmd={' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -1227,6 +1248,8 @@ def _run_ffmpeg_remux(
         text=True,
     )
     pid = proc.pid
+    if req_id:
+        ACTIVE_SUBPROCESSES.setdefault(req_id, set()).add(proc)
     logger.info(f"[REMUX DEBUG] ffmpeg_started=True")
     logger.info(f"[REMUX DEBUG] ffmpeg_pid={pid}")
 
@@ -1234,8 +1257,18 @@ def _run_ffmpeg_remux(
         stdout, stderr = proc.communicate(timeout=timeout_s)
         retcode = proc.returncode
         err_msg = stderr.strip() if retcode != 0 else None
+        t_elapsed = time.time() - t_start
+        logger.info(
+            f"[VIDEO TRACE] request_id={req_id or 'unknown'} ffmpeg_done returncode={retcode} "
+            f"elapsed={t_elapsed:.2f}s timeout={timeout_s}s"
+        )
         return retcode, pid, err_msg
     except subprocess.TimeoutExpired:
+        t_elapsed = time.time() - t_start
+        logger.error(
+            f"[VIDEO TRACE] request_id={req_id or 'unknown'} ffmpeg_timeout expired={timeout_s}s "
+            f"elapsed={t_elapsed:.2f}s (pid={pid})"
+        )
         logger.error(f"[REMUX DEBUG] ffmpeg_error=TimeoutExpired after {timeout_s}s (pid={pid})")
         try:
             proc.kill()
@@ -1252,7 +1285,10 @@ def _run_ffmpeg_remux(
                 pass
         return -1, pid, f"FFmpeg execution timed out after {timeout_s}s"
     except Exception as run_err:
-        logger.error(f"[REMUX DEBUG] ffmpeg_error={run_err}")
+        t_elapsed = time.time() - t_start
+        logger.error(
+            f"[VIDEO TRACE] request_id={req_id or 'unknown'} ffmpeg_error={run_err} elapsed={t_elapsed:.2f}s"
+        )
         try:
             proc.kill()
             proc.wait(timeout=5)
@@ -1264,6 +1300,11 @@ def _run_ffmpeg_remux(
             except Exception:
                 pass
         return -1, pid, str(run_err)
+    finally:
+        if req_id and req_id in ACTIVE_SUBPROCESSES:
+            ACTIVE_SUBPROCESSES[req_id].discard(proc)
+            if not ACTIVE_SUBPROCESSES[req_id]:
+                ACTIVE_SUBPROCESSES.pop(req_id, None)
 
 
 def normalize_video_for_ios(
@@ -1271,11 +1312,13 @@ def normalize_video_for_ios(
     source_has_audio: bool = True,
     temp_dir: Optional[Path] = None,
     audio_path: Optional[Path] = None,
+    req_id: Optional[str] = None,
 ) -> tuple[Path, dict]:
     """
     Normalizes video file to an iOS-compatible MP4 container (H.264 + AAC).
     - If already iOS-compatible: stream-copy / remux with faststart (-c copy -movflags +faststart).
     - Transcoding is ONLY performed when strictly necessary for iOS compatibility.
+    - Uses Render-optimized ultrafast preset and 120s timeout when transcoding is required.
     - NEVER normalizes the same file twice.
     - Enforces hard timeout with safe process kill, temp cleanup, and clear error logging.
     Returns: (final_file_path, probe_info)
@@ -1332,7 +1375,7 @@ def normalize_video_for_ios(
         cmd.extend(["-c", "copy", "-movflags", "+faststart", str(norm_file)])
 
         logger.info(f"[REMUX DEBUG] ffmpeg_command={' '.join(cmd)}")
-        retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=30, norm_file=norm_file)
+        retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=30, norm_file=norm_file, req_id=req_id)
         logger.info(f"[REMUX DEBUG] ffmpeg_returncode={retcode}")
         logger.info(f"[REMUX DEBUG] ffmpeg_error={err_msg}")
 
@@ -1374,8 +1417,8 @@ def normalize_video_for_ios(
     else:
         cmd.extend([
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
+            "-preset", "ultrafast",
+            "-crf", "22",
             "-pix_fmt", "yuv420p",
         ])
 
@@ -1392,7 +1435,7 @@ def normalize_video_for_ios(
     cmd.extend(["-movflags", "+faststart", str(norm_file)])
 
     logger.info(f"[REMUX DEBUG] ffmpeg_command={' '.join(cmd)}")
-    retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=75, norm_file=norm_file)
+    retcode, pid, err_msg = _run_ffmpeg_remux(cmd, timeout_s=120, norm_file=norm_file, req_id=req_id)
     logger.info(f"[REMUX DEBUG] ffmpeg_returncode={retcode}")
     logger.info(f"[REMUX DEBUG] ffmpeg_error={err_msg}")
 
@@ -1714,7 +1757,11 @@ async def get_media_preview(url: str) -> tuple[bool, Optional[MediaInfo], Option
         )
         return True, media_info, None
 
+    t_ext_start = time.time()
+    logger.info(f"[VIDEO TRACE] extraction_start url={url}")
     success, media_info, err = await asyncio.to_thread(_sync_extract_preview, url)
+    t_ext_done = time.time()
+    logger.info(f"[VIDEO TRACE] extraction_done elapsed={t_ext_done - t_ext_start:.2f}s success={success}")
     if success and media_info and media_info.raw_info:
         await db.put_metadata(
             url_hash=url_hash,
@@ -1981,7 +2028,7 @@ def _sync_download(
 
                         # Normalize to iOS-compatible H.264 + AAC MP4 with faststart
                         item_file, item_probe = normalize_video_for_ios(
-                            item_file, source_has_audio=entry_has_audio, temp_dir=temp_dir
+                            item_file, source_has_audio=entry_has_audio, temp_dir=temp_dir, req_id=req_id
                         )
                         has_v = item_probe.get("has_video", False)
                         has_a = item_probe.get("has_audio", False)
@@ -2299,6 +2346,8 @@ def _sync_download(
         ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_bin).parent)
 
     try:
+        t_ext_start = time.time()
+        logger.info(f"[VIDEO TRACE] request_id={req_id or 'unknown'} extraction_start url={url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = None
             if cached_info:
@@ -2325,6 +2374,12 @@ def _sync_download(
 
             if not info_dict and platform_info.key == "instagram":
                 info_dict = _extract_instagram_embed_fallback(url)
+
+            t_ext_done = time.time()
+            logger.info(
+                f"[VIDEO TRACE] request_id={req_id or 'unknown'} extraction_done "
+                f"elapsed={t_ext_done - t_ext_start:.2f}s success={bool(info_dict)}"
+            )
 
             if not info_dict:
                 record_download_finish(success=False)
@@ -2470,12 +2525,12 @@ def _sync_download(
                         "-movflags", "+faststart",
                         str(merged_out),
                     ]
-                    m_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-                    if m_proc.returncode == 0 and merged_out.exists() and merged_out.stat().st_size > 0:
+                    m_ret, m_pid, m_err = _run_ffmpeg_remux(cmd, timeout_s=90, norm_file=merged_out, req_id=req_id)
+                    if m_ret == 0 and merged_out.exists() and merged_out.stat().st_size > 0:
                         downloaded_file = merged_out
                         ffmpeg_merge_status = "success"
                     else:
-                        logger.error(f"FFmpeg merge of separate files failed: {m_proc.stderr}")
+                        logger.error(f"FFmpeg merge of separate files failed: {m_err}")
                         downloaded_file = v_cand
                 else:
                     downloaded_file = v_cand
@@ -2585,6 +2640,7 @@ def _sync_download(
                         downloaded_file,
                         source_has_audio=source_has_audio,
                         temp_dir=temp_dir,
+                        req_id=req_id,
                     )
                 except Exception as norm_err:
                     record_download_finish(success=False)
@@ -2958,23 +3014,58 @@ async def download_media(
     cached_info: Optional[dict] = None,
     extraction_time_s: float = 0.0,
 ) -> DownloadResult:
-    """Asynchronous wrapper with concurrency semaphore."""
+    """Asynchronous wrapper with concurrency semaphore and deterministic timeout."""
+    effective_req_id = req_id or uuid.uuid4().hex[:12]
     async with DOWNLOAD_SEMAPHORE:
-        res = await asyncio.to_thread(
-            _sync_download,
-            url=url,
-            user_id=user_id,
-            quality=quality,
-            req_id=req_id,
-            progress_callback=progress_callback,
-            cached_info=cached_info,
-            extraction_time_s=extraction_time_s,
-        )
-        if not res.success and res.error_code:
+        t_dl_start = time.time()
+        logger.info(f"[VIDEO TRACE] request_id={effective_req_id} download_start t={t_dl_start:.3f}")
+        try:
+            res = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _sync_download,
+                    url=url,
+                    user_id=user_id,
+                    quality=quality,
+                    req_id=effective_req_id,
+                    progress_callback=progress_callback,
+                    cached_info=cached_info,
+                    extraction_time_s=extraction_time_s,
+                ),
+                timeout=float(DOWNLOAD_TIMEOUT_SECONDS),
+            )
+            t_dl_done = time.time()
+            logger.info(
+                f"[VIDEO TRACE] request_id={effective_req_id} download_done t={t_dl_done:.3f} "
+                f"elapsed={t_dl_done - t_dl_start:.2f}s success={res.success}"
+            )
+            if not res.success and res.error_code:
+                await record_error(
+                    platform=detect_platform_from_url(url).key,
+                    url=url,
+                    error_code=res.error_code,
+                    error_message=res.error_message or "",
+                )
+            return res
+        except asyncio.TimeoutError:
+            t_timeout = time.time()
+            logger.error(
+                f"[VIDEO TRACE] request_id={effective_req_id} download_timeout t={t_timeout:.3f} "
+                f"exceeded={DOWNLOAD_TIMEOUT_SECONDS}s"
+            )
+            cancel_download(effective_req_id)
+            # Remove any active temp directory created for this user
+            for adir in list(ACTIVE_TEMP_DIRS):
+                if f"user_{user_id}_" in adir.name:
+                    cleanup_temp_dir(adir)
+            record_download_finish(success=False)
             await record_error(
                 platform=detect_platform_from_url(url).key,
                 url=url,
-                error_code=res.error_code,
-                error_message=res.error_message or "",
+                error_code="DOWNLOAD_TIMEOUT",
+                error_message=f"Download timed out after {DOWNLOAD_TIMEOUT_SECONDS}s",
             )
-        return res
+            return DownloadResult(
+                success=False,
+                error_code="DOWNLOAD_TIMEOUT",
+                error_message="⏱ Download timed out. The server or platform took too long to respond. Please try again or select a lower resolution.",
+            )

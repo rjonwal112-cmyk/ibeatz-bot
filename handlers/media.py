@@ -461,27 +461,10 @@ async def _download_and_deliver(
         except Exception:
             pass
 
-    last_update_time = [0.0]
-
     def _on_progress(percent: str, speed: str, eta: str) -> None:
         job_queue.update_progress(req_id, percent, speed, eta)
-        now = time.time()
-        if now - last_update_time[0] >= 2.0:
-            last_update_time[0] = now
-            if speed == "merging":
-                job_queue.update_status(req_id, JobStatus.MERGING)
-                text = "⚙️ Remuxing video & audio…"
-            elif speed and speed != "N/A" and eta and eta != "N/A":
-                text = f"⬇️ Downloading {percent} ({speed}, ETA {eta})"
-            else:
-                text = f"⬇️ Downloading {percent}"
-            async def _safe_edit() -> None:
-                try:
-                    await status_msg.edit_text(text, reply_markup=cancel_kb if not is_group else None)
-                except Exception as e:
-                    logger.debug(f"Progress update edit_text ignored: {e}")
-
-            asyncio.run_coroutine_threadsafe(_safe_edit(), loop)
+        if speed == "merging":
+            job_queue.update_status(req_id, JobStatus.MERGING)
 
     cached_raw_info = media_info.raw_info if media_info else None
     extraction_time_s = media_info.extraction_time_s if media_info else 0.0
@@ -489,7 +472,7 @@ async def _download_and_deliver(
     upload_path_str: Optional[str] = None
 
     try:
-        logger.info("download started")
+        logger.info(f"[VIDEO TRACE] request_id={req_id} download_start url={url}")
         result = await download_media(
             url=url,
             user_id=user_id,
@@ -502,7 +485,7 @@ async def _download_and_deliver(
         temp_dir = result.temp_dir
 
         if not result.success:
-            logger.error(f"Download failed for {url}: {result.error_message}")
+            logger.error(f"[VIDEO TRACE] request_id={req_id} download_failed error={result.error_message}")
             job_queue.finish_job(req_id, success=False, error=result.error_message)
             async with IN_FLIGHT_LOCK:
                 if flight_future and not flight_future.done():
@@ -516,27 +499,15 @@ async def _download_and_deliver(
             )
             return
 
-        logger.info("download completed")
-        logger.info(f"DOWNLOAD COMPLETE: {req_id}")
         file_path = result.file_path
         file_exists = file_path.exists() if file_path else False
         file_sz = file_path.stat().st_size if (file_path and file_exists) else 0
 
-        logger.info(f"file path: {file_path}")
-        logger.info(f"file exists: {file_exists}")
-        logger.info(f"file size: {file_sz} bytes")
-
+        logger.info(f"[VIDEO TRACE] request_id={req_id} download_done path={file_path} exists={file_exists} size={file_sz}")
         info = result.media_info
         raw_title = (info.title if info else None) or (result.file_path.stem if result.file_path else "Media")
         source_url = url or ""
         caption = build_media_caption(source_url)
-
-        job_queue.update_status(req_id, JobStatus.UPLOADING)
-        if status_msg:
-            try:
-                asyncio.create_task(status_msg.edit_text("⚡ Uploading…", reply_markup=None))
-            except Exception:
-                pass
 
         t_upload_start = time.time()
         sent_msg = None
@@ -569,15 +540,11 @@ async def _download_and_deliver(
                         else:
                             norm_probe = probe_media_detailed(ipath)
                             if not ipath.name.endswith("_ios.mp4") and not norm_probe.get("is_ios_compatible") and ipath.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-                                if status_msg:
-                                    try:
-                                        await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
-                                    except Exception:
-                                        pass
                                 try:
                                     ipath, norm_probe = normalize_video_for_ios(
                                         ipath,
                                         source_has_audio=norm_probe.get("has_audio", True),
+                                        req_id=req_id,
                                     )
                                 except Exception as c_norm_err:
                                     logger.error(f"Carousel item normalization error: {c_norm_err}")
@@ -595,6 +562,12 @@ async def _download_and_deliver(
                                 logger.info("AUDIO SOURCE: unavailable")
                             media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
 
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text("⚡ Uploading…", reply_markup=None)
+                        except Exception:
+                            pass
+                    logger.info(f"[VIDEO TRACE] request_id={req_id} upload_start carousel_chunk={c_idx}")
                     try:
                         sent = await message.reply_media_group(media=media_group, request_timeout=300)
                         total_sent += len(chunk)
@@ -617,17 +590,25 @@ async def _download_and_deliver(
                                     total_sent += 1
                                 except Exception as item_err:
                                     logger.error(f"[Telegram upload error] Failed to deliver carousel item {c_idx * 10 + idx} ({ipath.name}): {item_err}")
+                    logger.info(f"[VIDEO TRACE] request_id={req_id} upload_done carousel_chunk={c_idx}")
                 else:
                     # Single item chunk (e.g. 11th item)
                     itype, ipath = chunk[0]
                     item_cap = caption if (c_idx == 0 and total_sent == 0) else None
                     mf = FSInputFile(ipath, chunk_size=524288)
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text("⚡ Uploading…", reply_markup=None)
+                        except Exception:
+                            pass
+                    logger.info(f"[VIDEO TRACE] request_id={req_id} upload_start carousel_single={itype}")
                     try:
                         if itype == "photo":
                             await message.reply_photo(photo=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
                         else:
                             await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", supports_streaming=True, request_timeout=120)
                         total_sent += 1
+                        logger.info(f"[VIDEO TRACE] request_id={req_id} upload_done carousel_single={itype}")
                     except Exception as item_err:
                         logger.error(f"[Telegram upload error] Failed to deliver single carousel item ({ipath.name}): {item_err}")
 
@@ -664,6 +645,12 @@ async def _download_and_deliver(
             is_photo = upload_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") or (info and getattr(info, "media_type", "") == "photo")
 
             if result.is_audio:
+                if status_msg:
+                    try:
+                        await status_msg.edit_text("⚡ Uploading…", reply_markup=None)
+                    except Exception:
+                        pass
+                logger.info(f"[VIDEO TRACE] request_id={req_id} upload_start type=audio path={upload_path}")
                 try:
                     sent_msg = await message.reply_audio(
                         audio=media_file,
@@ -686,6 +673,12 @@ async def _download_and_deliver(
                         request_timeout=300,
                     )
             elif is_photo:
+                if status_msg:
+                    try:
+                        await status_msg.edit_text("⚡ Uploading…", reply_markup=None)
+                    except Exception:
+                        pass
+                logger.info(f"[VIDEO TRACE] request_id={req_id} upload_start type=photo path={upload_path}")
                 try:
                     sent_msg = await message.reply_photo(
                         photo=media_file,
@@ -715,15 +708,11 @@ async def _download_and_deliver(
                 norm_probe = probe_media_detailed(upload_path)
                 is_already_norm = bool(getattr(result, "is_normalized", False) or upload_path.name.endswith("_ios.mp4"))
                 if not is_already_norm and not norm_probe.get("is_ios_compatible") and upload_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-                    if status_msg:
-                        try:
-                            await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
-                        except Exception:
-                            pass
                     try:
                         upload_path, norm_probe = normalize_video_for_ios(
                             upload_path,
                             source_has_audio=source_has_audio,
+                            req_id=req_id,
                         )
                         result.is_normalized = True
                     except Exception as norm_err:
@@ -791,6 +780,28 @@ async def _download_and_deliver(
                         await status_msg.edit_text(f"❌ Validation failed: Container {cont} is not compatible with iOS.")
                     return
 
+                # File stability check: verify completely written & size stable
+                sz_initial = upload_path.stat().st_size
+                await asyncio.sleep(0.1)
+                sz_stable = upload_path.stat().st_size
+                if sz_stable != sz_initial:
+                    await asyncio.sleep(0.5)
+                    sz_stable = upload_path.stat().st_size
+
+                logger.info(
+                    f"[VIDEO TRACE] request_id={req_id} final_probe path={upload_path} "
+                    f"size={sz_stable} vcodec={v_codec} acodec={a_codec} has_v={has_v} has_a={has_a}"
+                )
+
+                # Transition status to Uploading ONLY after final validation passes
+                if status_msg:
+                    try:
+                        await status_msg.edit_text("⚡ Uploading…", reply_markup=None)
+                    except Exception:
+                        pass
+
+                logger.info(f"[VIDEO TRACE] request_id={req_id} upload_start type=video path={upload_path}")
+
                 v_duration = int(info.duration) if (info and info.duration and int(info.duration) > 0) else None
                 v_width = norm_probe.get("width") or (int(info.width) if (info and info.width and int(info.width) > 0) else None)
                 v_height = norm_probe.get("height") or (int(info.height) if (info and info.height and int(info.height) > 0) else None)
@@ -841,12 +852,16 @@ async def _download_and_deliver(
                                 sent_msg = None
 
             if not sent_msg:
+                logger.error(f"[VIDEO TRACE] request_id={req_id} upload_failed for {upload_path}")
                 logger.error(f"Telegram upload failed: all send attempts failed for {upload_path}")
                 job_queue.finish_job(req_id, success=False, error="Telegram send failed")
                 if status_msg:
                     await status_msg.edit_text("❌ Couldn't upload media to Telegram. Please try again.")
                 return
 
+            logger.info(
+                f"[VIDEO TRACE] request_id={req_id} upload_done elapsed={time.time() - t_upload_start:.2f}s"
+            )
             logger.info("Telegram send completed")
             logger.info(f"TELEGRAM DELIVERY COMPLETE: {req_id}")
 
@@ -936,6 +951,7 @@ async def _download_and_deliver(
             pass
 
     finally:
+        cancel_download(req_id)
         await job_queue.release_slot(req_id)
         if upload_path_str:
             media_cache.release_file_use(upload_path_str)
@@ -1013,9 +1029,9 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
             return
 
     try:
-        status_msg = await message.reply("🔎 Fetching…")
+        status_msg = await message.reply("⬇️ Downloading…")
     except Exception:
-        status_msg = await message.answer("🔎 Fetching…")
+        status_msg = await message.answer("⬇️ Downloading…")
 
     # 2. Check in-flight concurrent download (Request coalescing - Requirement 8)
     flight_key = f"{platform_key}:{media_id}"
@@ -1026,7 +1042,6 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
 
     if flight_future:
         try:
-            await status_msg.edit_text("⏳ Media is already downloading, waiting for result…")
             entry = await asyncio.wait_for(asyncio.shield(flight_future), timeout=180)
             if entry:
                 record_cache_hit()
@@ -1071,8 +1086,10 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
 
     # 3. Metadata Inspection & Quality Decision Policy
     logger.info("extract started")
+    logger.info(f"[VIDEO TRACE] request_id={req_id} extraction_start url={norm_url}")
     success, media_info, error_msg = await get_media_preview(norm_url)
     logger.info("extract completed")
+    logger.info(f"[VIDEO TRACE] request_id={req_id} extraction_done success={success} has_info={bool(media_info)}")
 
     if not success or not media_info:
         logger.error(f"Extraction failed for {url}: {error_msg}")
