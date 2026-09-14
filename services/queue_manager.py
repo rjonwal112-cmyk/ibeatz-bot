@@ -5,7 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from config import MAX_CONCURRENT_DOWNLOADS
+from config import ADMIN_IDS, MAX_CONCURRENT_DOWNLOADS
+from services.stats import is_maintenance_mode
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,12 @@ class JobQueueManager:
         platform: str,
         url: str,
         quality: str,
-    ) -> Job:
+    ) -> Optional[Job]:
         """Enrolls a new job into the queue registry."""
+        if is_maintenance_mode() and not (user_id in ADMIN_IDS and user_id != 0):
+            logger.info(f"Queue rejected job {job_id} for user {user_id} due to active maintenance mode")
+            return None
+
         async with self._lock:
             is_primary = platform.lower() in ("youtube", "instagram", "facebook")
             job = Job(

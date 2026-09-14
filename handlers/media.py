@@ -53,7 +53,7 @@ from services import (
 )
 from services.platforms import SUPPORTED_PLATFORMS, detect_platform_from_url
 from services.stats import record_delivery_metric
-from handlers.admin import record_group_update, record_group_url
+from handlers.admin import is_admin, record_group_update, record_group_url
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +248,12 @@ async def _deliver_cached_media(
         logger.info(f"CONTAINER CHECK: {cont}")
         logger.info(f"STREAMS: video={has_v} audio={has_a}")
         if not has_a:
-            logger.info("AUDIO SOURCE: unavailable")
+            if getattr(entry, "has_audio", True):
+                logger.warning("Cached video is silent despite source having audio! Bypassing fast-path to re-download.")
+                has_local_file = False
+                entry.telegram_file_id = None
+            else:
+                logger.info("AUDIO SOURCE: unavailable")
 
     # Fast Path 1: Telegram file_id (instant 0.1s delivery)
     if entry.telegram_file_id:
@@ -467,10 +472,13 @@ async def _download_and_deliver(
                 text = f"⬇️ Downloading {percent} ({speed}, ETA {eta})"
             else:
                 text = f"⬇️ Downloading {percent}"
-            asyncio.run_coroutine_threadsafe(
-                status_msg.edit_text(text, reply_markup=cancel_kb),
-                loop,
-            )
+            async def _safe_edit() -> None:
+                try:
+                    await status_msg.edit_text(text, reply_markup=cancel_kb if not is_group else None)
+                except Exception as e:
+                    logger.debug(f"Progress update edit_text ignored: {e}")
+
+            asyncio.run_coroutine_threadsafe(_safe_edit(), loop)
 
     cached_raw_info = media_info.raw_info if media_info else None
     extraction_time_s = media_info.extraction_time_s if media_info else 0.0
@@ -558,6 +566,11 @@ async def _download_and_deliver(
                         else:
                             norm_probe = probe_media_detailed(ipath)
                             if not norm_probe.get("is_ios_compatible") and ipath.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                                if status_msg:
+                                    try:
+                                        await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
+                                    except Exception:
+                                        pass
                                 ipath, norm_probe = normalize_video_for_ios(
                                     ipath,
                                     source_has_audio=norm_probe.get("has_audio", True),
@@ -594,7 +607,7 @@ async def _download_and_deliver(
                                     if itype == "photo":
                                         await message.reply_photo(photo=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
                                     else:
-                                        await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                                        await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", supports_streaming=True, request_timeout=120)
                                     total_sent += 1
                                 except Exception as item_err:
                                     logger.error(f"[Telegram upload error] Failed to deliver carousel item {c_idx * 10 + idx} ({ipath.name}): {item_err}")
@@ -607,7 +620,7 @@ async def _download_and_deliver(
                         if itype == "photo":
                             await message.reply_photo(photo=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
                         else:
-                            await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", request_timeout=120)
+                            await message.reply_video(video=mf, caption=item_cap, parse_mode="HTML", supports_streaming=True, request_timeout=120)
                         total_sent += 1
                     except Exception as item_err:
                         logger.error(f"[Telegram upload error] Failed to deliver single carousel item ({ipath.name}): {item_err}")
@@ -692,11 +705,17 @@ async def _download_and_deliver(
                         )
             else:
                 # Validation and normalization before Telegram upload using ffprobe
+                source_has_audio = getattr(info, "has_audio", True) if info else True
                 norm_probe = probe_media_detailed(upload_path)
                 if not norm_probe.get("is_ios_compatible") and upload_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text("⚙️ Processing video…", reply_markup=None)
+                        except Exception:
+                            pass
                     upload_path, norm_probe = normalize_video_for_ios(
                         upload_path,
-                        source_has_audio=norm_probe.get("has_audio", True),
+                        source_has_audio=source_has_audio,
                     )
                     media_file = FSInputFile(upload_path, chunk_size=524288)
                     result.file_path = upload_path
@@ -706,13 +725,21 @@ async def _download_and_deliver(
                 cont = norm_probe.get("container") or "unknown"
                 has_v = norm_probe.get("has_video", False)
                 has_a = norm_probe.get("has_audio", False)
+                v_dur = norm_probe.get("duration") or (int(info.duration) if (info and info.duration) else None)
+
+                # MANDATORY PRE-UPLOAD LOGS
+                logger.info(f"VIDEO STREAM = {'TRUE' if has_v else 'FALSE'}")
+                logger.info(f"AUDIO STREAM = {'TRUE' if has_a else 'FALSE'}")
+                logger.info(f"final_video_codec={v_codec}")
+                logger.info(f"final_audio_codec={a_codec}")
+                logger.info(f"final_duration={v_dur}")
 
                 logger.info(f"VIDEO CHECK: codec={v_codec}")
                 logger.info(f"AUDIO CHECK: codec={a_codec}")
                 logger.info(f"CONTAINER CHECK: {cont}")
                 logger.info(f"STREAMS: video={has_v} audio={has_a}")
 
-                if not has_a:
+                if not has_a and not source_has_audio:
                     logger.info("AUDIO SOURCE: unavailable")
 
                 # iOS and stream validation:
@@ -723,7 +750,6 @@ async def _download_and_deliver(
                         await status_msg.edit_text("❌ Validation failed: Downloaded video does not contain a valid video stream.")
                     return
 
-                source_has_audio = getattr(info, "has_audio", True) if info else True
                 if source_has_audio and not has_a:
                     logger.error(f"Validation failed: Audio missing in delivered video {upload_path} despite source having audio!")
                     job_queue.finish_job(req_id, success=False, error="Audio stream missing")
@@ -916,9 +942,12 @@ async def _process_single_media_url(message: Message, url: str, is_group: bool) 
 
     record_request()
 
-    # Maintenance mode check
-    if is_maintenance_mode():
-        await message.reply("🛠 Bot is temporarily undergoing maintenance. Please try again shortly.")
+    # Maintenance mode check (Admins bypass maintenance)
+    if is_maintenance_mode() and not is_admin(user_id):
+        await message.reply(
+            "🛠 Bot is temporarily undergoing maintenance.\n"
+            "Please try again shortly."
+        )
         return
 
     t_start = time.time()
@@ -1156,6 +1185,14 @@ async def media_url_handler(message: Message) -> None:
     user = message.from_user
     user_id = user.id if user else 0
 
+    # Maintenance mode check: normal users cannot start downloads
+    if is_maintenance_mode() and not is_admin(user_id):
+        await message.reply(
+            "🛠 Bot is temporarily undergoing maintenance.\n"
+            "Please try again shortly."
+        )
+        return
+
     # Rate limiting per message in private chat
     if not is_group and user_id:
         now = time.time()
@@ -1197,6 +1234,11 @@ async def quality_choice_callback(callback: CallbackQuery) -> None:
     # Enforce callback requester ownership in groups
     if callback.from_user.id != requester_id:
         await callback.answer("⚠️ Only the requester can interact with this button.", show_alert=True)
+        return
+
+    # Maintenance mode check: normal users cannot start downloads
+    if is_maintenance_mode() and not is_admin(callback.from_user.id):
+        await callback.answer("🛠 Bot is temporarily undergoing maintenance.\nPlease try again shortly.", show_alert=True)
         return
 
     req_data = PENDING_REQUESTS.get(req_id)
@@ -1291,6 +1333,11 @@ async def post_delivery_audio_callback(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     if len(parts) < 4:
         await callback.answer("Invalid audio request.", show_alert=True)
+        return
+
+    # Maintenance mode check: normal users cannot start downloads
+    if is_maintenance_mode() and not is_admin(callback.from_user.id):
+        await callback.answer("🛠 Bot is temporarily undergoing maintenance.\nPlease try again shortly.", show_alert=True)
         return
 
     plat_key = parts[1]

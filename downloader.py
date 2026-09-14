@@ -18,6 +18,13 @@ from typing import Any, Callable, Optional
 
 import yt_dlp
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    Image = None
+    HAS_PIL = False
+
 from config import (
     BASE_DOWNLOAD_DIR,
     MAX_CONCURRENT_DOWNLOADS,
@@ -108,7 +115,22 @@ def _patch_instagram_extractor() -> None:
                         '__bbox', 'result', 'data', 'xig_polaris_media', {dict}, any))
                     product_info = traverse_obj(media, ('if_not_gated_logged_out', {dict}))
                     if product_info:
-                        return self._extract_product(product_info, video_id=video_id, get_comments=False)
+                        res = self._extract_product(product_info, video_id=video_id, get_comments=False)
+                        if isinstance(res, dict):
+                            res["original_width"] = product_info.get("original_width")
+                            res["original_height"] = product_info.get("original_height")
+                            res["image_versions2"] = product_info.get("image_versions2")
+                            res["display_uri"] = product_info.get("display_uri")
+                            cm = product_info.get("carousel_media") or []
+                            entries = res.get("entries") or []
+                            if cm and entries:
+                                for idx, entry in enumerate(entries):
+                                    if idx < len(cm) and isinstance(entry, dict) and isinstance(cm[idx], dict):
+                                        entry["original_width"] = cm[idx].get("original_width")
+                                        entry["original_height"] = cm[idx].get("original_height")
+                                        entry["image_versions2"] = cm[idx].get("image_versions2")
+                                        entry["display_uri"] = cm[idx].get("display_uri")
+                        return res
                 raise
 
         InstagramIE._real_extract = patched_real_extract
@@ -325,6 +347,233 @@ def _has_audio_in_format(f: dict) -> bool:
     return False
 
 
+def inspect_image_dimensions(image_path: Path) -> tuple[Optional[int], Optional[int]]:
+    """Inspects downloaded image width and height using PIL (with ffprobe fallback)."""
+    if not image_path or not image_path.exists():
+        return None, None
+    if HAS_PIL and Image is not None:
+        try:
+            with Image.open(image_path) as img:
+                return img.width, img.height
+        except Exception as e:
+            logger.debug(f"PIL inspection failed for {image_path.name}: {e}")
+    probe = probe_media_detailed(image_path)
+    return probe.get("width"), probe.get("height")
+
+
+def select_best_photo_candidate(info_dict: dict, fallback_url: Optional[str] = None) -> dict:
+    """
+    Ranks all available photo candidates by actual pixel area (width * height).
+    Preserves original aspect ratio and prefers uncropped master originals over
+    cropped or downscaled variants.
+
+    Returns:
+    {
+        "selected_url": str,
+        "width": Optional[int],
+        "height": Optional[int],
+        "aspect_ratio": Optional[float],
+        "source_candidates": int,
+    }
+    """
+    raw_candidates: list[Any] = []
+
+    # 1. Gather all candidates from various metadata keys
+    if isinstance(info_dict, dict):
+        # image_versions2 (Instagram direct Polaris candidates)
+        iv2 = info_dict.get("image_versions2")
+        if isinstance(iv2, dict):
+            c_list = iv2.get("candidates") or []
+            if isinstance(c_list, list):
+                raw_candidates.extend(c_list)
+
+        # thumbnails list
+        thumbs = info_dict.get("thumbnails")
+        if isinstance(thumbs, list):
+            raw_candidates.extend(thumbs)
+
+        # single field candidates
+        for k in ("display_uri", "display_url", "url", "thumbnail"):
+            val = info_dict.get(k)
+            if val and isinstance(val, str) and val.startswith(("http://", "https://")):
+                raw_candidates.append({"url": val})
+
+    if fallback_url and isinstance(fallback_url, str) and fallback_url.startswith(("http://", "https://")):
+        raw_candidates.append({"url": fallback_url})
+
+    # Reference original dimensions if known
+    orig_w = None
+    orig_h = None
+    if isinstance(info_dict, dict):
+        orig_w = info_dict.get("original_width") or info_dict.get("width")
+        orig_h = info_dict.get("original_height") or info_dict.get("height")
+    try:
+        orig_w = int(orig_w) if orig_w else None
+        orig_h = int(orig_h) if orig_h else None
+    except (ValueError, TypeError):
+        orig_w, orig_h = None, None
+
+    # Pre-scan candidate URLs to infer original dimensions and aspect ratio if missing
+    max_scale_bound = 0
+    if not (orig_w and orig_h):
+        for c in raw_candidates:
+            c_u = c.get("url") if isinstance(c, dict) else (c if isinstance(c, str) else "")
+            if not c_u:
+                continue
+            parsed_u = urllib.parse.urlparse(c_u)
+            stp_u = urllib.parse.parse_qs(parsed_u.query).get("stp", [""])[0]
+            c_match = re.search(r"c(\d+)\.(\d+)\.(\d+)\.(\d+)", stp_u)
+            if c_match:
+                cx, cy, cw, ch = int(c_match.group(1)), int(c_match.group(2)), int(c_match.group(3)), int(c_match.group(4))
+                if cx == 0 and cy > 0:
+                    orig_w = cw
+                    orig_h = cy * 2 + ch
+                    break
+                elif cy == 0 and cx > 0:
+                    orig_w = cx * 2 + cw
+                    orig_h = ch
+                    break
+                elif cx == 0 and cy == 0 and cw > 0 and ch > 0:
+                    orig_w = cw
+                    orig_h = ch
+                    break
+            s_match = re.search(r"[sp](\d+)x(\d+)", stp_u)
+            if s_match:
+                max_scale_bound = max(max_scale_bound, int(s_match.group(1)), int(s_match.group(2)))
+
+    orig_aspect = (orig_w / orig_h) if (orig_w and orig_h and orig_h > 0) else None
+
+    evaluated: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for c in raw_candidates:
+        if isinstance(c, str):
+            c_url = c
+            meta_w, meta_h = None, None
+        elif isinstance(c, dict):
+            c_url = c.get("url")
+            meta_w = c.get("width")
+            meta_h = c.get("height")
+        else:
+            continue
+
+        if not c_url or not isinstance(c_url, str) or not c_url.startswith(("http://", "https://")):
+            continue
+
+        # Ignore video streams
+        if any(c_url.lower().endswith(vext) for vext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3")):
+            continue
+
+        # Strip fragment
+        c_url_clean = c_url.split("#")[0]
+        if c_url_clean in seen_urls:
+            continue
+        seen_urls.add(c_url_clean)
+
+        parsed = urllib.parse.urlparse(c_url_clean)
+        qs = urllib.parse.parse_qs(parsed.query)
+        stp = qs.get("stp", [""])[0]
+
+        # Detect crop (e.g. c0.240.1440.1440a)
+        is_cropped = bool(re.search(r"c\d+\.\d+\.\d+\.\d+", stp))
+
+        # Detect scale (e.g. s640x640, p1080x1080)
+        scale_m = re.search(r"[sp](\d+)x(\d+)", stp)
+
+        # Master original check: uncropped, no scale modifier
+        is_master = ("dst-jpg" in stp or "stp=" not in c_url_clean) and not is_cropped and not scale_m
+
+        # Determine dimensions
+        w, h = None, None
+        if meta_w and meta_h:
+            try:
+                mw, mh = int(meta_w), int(meta_h)
+                if mw > 0 and mh > 0:
+                    w, h = mw, mh
+            except (ValueError, TypeError):
+                pass
+
+        if w is None or h is None:
+            if is_master:
+                if orig_w and orig_h:
+                    w, h = orig_w, orig_h
+                elif max_scale_bound > 0:
+                    w, h = max(max_scale_bound, 1080), max(max_scale_bound, 1080)
+                else:
+                    w, h = 1080, 1080
+            elif scale_m:
+                bound_w = int(scale_m.group(1))
+                bound_h = int(scale_m.group(2))
+                if is_cropped:
+                    w, h = bound_w, bound_h
+                elif orig_aspect:
+                    if orig_aspect >= 1.0:
+                        w = bound_w
+                        h = max(1, int(bound_w / orig_aspect))
+                    else:
+                        h = bound_h
+                        w = max(1, int(bound_h * orig_aspect))
+                else:
+                    w, h = bound_w, bound_h
+            elif is_cropped:
+                c_m = re.search(r"c\d+\.\d+\.(\d+)\.(\d+)", stp)
+                if c_m:
+                    w, h = int(c_m.group(1)), int(c_m.group(2))
+                else:
+                    w, h = 150, 150
+            elif orig_w and orig_h:
+                w, h = orig_w, orig_h
+            else:
+                w, h = 0, 0
+
+        area = (w or 0) * (h or 0)
+        is_direct_cdn = any(cdn in c_url_clean for cdn in ("fbcdn.net", "cdninstagram.com", "instagram.f"))
+        ar = round(w / h, 4) if (w and h and h > 0) else None
+
+        # Score tuple:
+        # 1. Uncropped preferred over cropped (preserves original aspect ratio)
+        # 2. Highest actual pixel area (width * height)
+        # 3. Master original preferred over scaled derivatives
+        # 4. Direct CDN URL preferred over proxy
+        score = (
+            1 if not is_cropped else 0,
+            area,
+            1 if is_master else 0,
+            1 if is_direct_cdn else 0,
+        )
+
+        evaluated.append({
+            "url": c_url_clean,
+            "width": w if (w and w > 0) else None,
+            "height": h if (h and h > 0) else None,
+            "aspect_ratio": ar,
+            "is_cropped": is_cropped,
+            "is_master": is_master,
+            "area": area,
+            "score": score,
+        })
+
+    if not evaluated:
+        return {
+            "selected_url": fallback_url or "",
+            "width": None,
+            "height": None,
+            "aspect_ratio": None,
+            "source_candidates": 0,
+        }
+
+    evaluated.sort(key=lambda x: x["score"], reverse=True)
+    best = evaluated[0]
+
+    return {
+        "selected_url": best["url"],
+        "width": best["width"],
+        "height": best["height"],
+        "aspect_ratio": best["aspect_ratio"],
+        "source_candidates": len(evaluated),
+    }
+
+
 def analyze_media_formats(
     formats: list[dict],
     platform_info: PlatformInfo,
@@ -465,9 +714,9 @@ def _build_format_options(
     if plat_key in ("instagram", "facebook"):
         if has_ffmpeg:
             merge_output_format = "mp4"
-            format_spec = "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best"
+            format_spec = "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best"
         else:
-            format_spec = "best[vcodec!=none][acodec!=none]/best"
+            format_spec = "best[vcodec!=none][acodec!=none]/best[acodec!=none]/best"
         return format_spec, postprocessors, merge_output_format
 
     # YouTube and generic platforms for 'highest' / 'best':
@@ -476,11 +725,12 @@ def _build_format_options(
         if has_ffmpeg:
             merge_output_format = "mp4"
             format_spec = (
-                "22/18/"
                 "bestvideo[height<=1080]+bestaudio/"
                 "bestvideo+bestaudio/"
+                "22/18/"
                 "best[height<=1080][vcodec!=none][acodec!=none]/"
                 "best[vcodec!=none][acodec!=none]/"
+                "best[acodec!=none]/"
                 "best"
             )
         else:
@@ -488,6 +738,7 @@ def _build_format_options(
                 "22/18/"
                 "best[height<=1080][vcodec!=none][acodec!=none]/"
                 "best[vcodec!=none][acodec!=none]/"
+                "best[acodec!=none]/"
                 "best"
             )
         return format_spec, postprocessors, merge_output_format
@@ -879,9 +1130,11 @@ def probe_media_detailed(file_path: Optional[Path]) -> dict:
                         info["video_codec"] = cname
                         info["width"] = s.get("width")
                         info["height"] = s.get("height")
+                        info["pix_fmt"] = s.get("pix_fmt")
                     elif ctype == "audio" and not info["has_audio"]:
                         info["has_audio"] = True
                         info["audio_codec"] = cname
+                        info["channels"] = s.get("channels")
         except Exception as probe_err:
             logger.debug(f"ffprobe detailed check failed for {file_path}: {probe_err}")
 
@@ -909,28 +1162,39 @@ def probe_media_detailed(file_path: Optional[Path]) -> dict:
     if not info["container"]:
         info["container"] = file_path.suffix.lstrip(".").lower()
 
-    # Evaluate iOS compatibility:
-    # 1. Container must be MP4 (or mov,mp4 container format)
-    # 2. Video codec must be h264 / avc1 (NEVER vp9 or av1)
-    # 3. Audio codec (if present) must be aac
-    v_ok = bool(info["has_video"] and info["video_codec"] in ("h264", "avc1"))
-    a_ok = bool(not info["has_audio"] or info["audio_codec"] == "aac")
-    c_ok = bool(info["container"] and ("mp4" in info["container"] or file_path.suffix.lower() == ".mp4"))
-    info["is_ios_compatible"] = bool(v_ok and a_ok and c_ok)
-
+    info["is_ios_compatible"] = is_ios_compatible(info)
     return info
+
+
+def is_ios_compatible(probe_info: dict) -> bool:
+    """
+    Evaluates iOS compatibility:
+    1. Container must be MP4 (or mov,mp4 container format)
+    2. Video codec must be h264 / avc1 (NEVER vp9 or av1) and pixel format yuv420p (never 10-bit or yuv444p)
+    3. Audio codec (if present) must be aac and stereo/mono (<= 2 channels)
+    """
+    if not probe_info:
+        return False
+    v_ok = bool(probe_info.get("has_video") and probe_info.get("video_codec") in ("h264", "avc1") and probe_info.get("pix_fmt") in ("yuv420p", None))
+    a_ok = bool(not probe_info.get("has_audio") or (probe_info.get("audio_codec") == "aac" and (probe_info.get("channels") is None or probe_info.get("channels") <= 2)))
+    cont = str(probe_info.get("container") or "")
+    c_ok = bool("mp4" in cont.lower())
+    return bool(v_ok and a_ok and c_ok)
 
 
 def normalize_video_for_ios(
     file_path: Path,
     source_has_audio: bool = True,
     temp_dir: Optional[Path] = None,
+    audio_path: Optional[Path] = None,
 ) -> tuple[Path, dict]:
     """
     Normalizes any video file to an iOS-compatible MP4 container (H.264 + AAC) with faststart.
-    - If already iOS-compatible (H.264 + AAC MP4): stream-copy / remux with faststart.
+    - If already iOS-compatible (H.264 + AAC MP4) and no separate audio needed: stream-copy / remux with faststart.
     - If video is VP9/AV1/etc. or audio is not AAC: transcode via FFmpeg (libx264 + aac).
-    - Explicitly maps streams: -map 0:v:0 -map 0:a:0?
+    - When separate streams: -map 0:v:0 -map 1:a:0.
+    - When single input has both streams: -map 0:v:0 -map 0:a:0.
+    - When source has no audio: -map 0:v:0.
     Returns: (final_file_path, probe_info)
     """
     if not file_path or not file_path.exists():
@@ -942,66 +1206,88 @@ def normalize_video_for_ios(
         return file_path, probe_media_detailed(file_path)
 
     probe = probe_media_detailed(file_path)
+    has_input_audio = bool(probe.get("has_audio"))
+    has_separate_audio = bool(audio_path and audio_path.exists() and audio_path.stat().st_size > 0)
+    needs_audio = bool(source_has_audio and (has_input_audio or has_separate_audio))
+
     logger.info(
         f"[iOS COMPATIBILITY CHECK] input={file_path.name}, vcodec={probe.get('video_codec')}, "
         f"acodec={probe.get('audio_codec')}, container={probe.get('container')}, "
-        f"is_ios_compatible={probe.get('is_ios_compatible')}"
+        f"is_ios_compatible={probe.get('is_ios_compatible')}, separate_audio={has_separate_audio}"
     )
 
     # Determine destination directory and target output path
     target_dir = temp_dir or file_path.parent
     norm_file = target_dir / f"{file_path.stem}_ios.mp4"
 
-    # Case 1: Already H.264 + AAC MP4 -> Stream copy / remux with faststart
-    if probe.get("is_ios_compatible") and file_path.suffix.lower() == ".mp4":
+    # Prevent duplicate normalization if file is already an iOS-normalized file
+    if not has_separate_audio and file_path.name.endswith("_ios.mp4") and probe.get("is_ios_compatible"):
+        logger.info(f"File {file_path.name} is already normalized for iOS, skipping duplicate normalization.")
+        return file_path, probe
+
+    # Case 1: Already H.264 + AAC MP4 and no separate audio merge required -> Stream copy / remux with faststart
+    if not has_separate_audio and probe.get("is_ios_compatible") and file_path.suffix.lower() == ".mp4":
         logger.info(f"File {file_path.name} is already iOS-compatible (H.264 + AAC MP4). Remuxing with faststart...")
         cmd = [
             ffmpeg_bin, "-y",
             "-i", str(file_path),
             "-map", "0:v:0",
         ]
-        if probe.get("has_audio"):
-            cmd.extend(["-map", "0:a:0?"])
+        if has_input_audio:
+            cmd.extend(["-map", "0:a:0"])
         cmd.extend(["-c", "copy", "-movflags", "+faststart", str(norm_file)])
 
         remux_res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if remux_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
             final_probe = probe_media_detailed(norm_file)
-            return norm_file, final_probe
+            if not needs_audio or final_probe.get("has_audio"):
+                return norm_file, final_probe
+            logger.warning(f"Fast remux lost audio ({remux_res.stderr}), falling back to transcode")
         else:
             logger.warning(f"Fast remux failed ({remux_res.stderr}), proceeding to transcode")
 
-    # Case 2: Transcode incompatible video (VP9 / AV1 / non-AAC / non-MP4)
-    logger.info(f"Normalizing incompatible video {file_path.name} (codec={probe.get('video_codec')}) to H.264 + AAC MP4 for iOS...")
+    # Case 2: Transcode / Merge incompatible video or separate audio streams
+    logger.info(f"Normalizing video {file_path.name} (codec={probe.get('video_codec')}) to H.264 + AAC MP4 for iOS...")
     cmd = [
         ffmpeg_bin, "-y",
         "-i", str(file_path),
-        "-map", "0:v:0",
     ]
-    if probe.get("has_audio") or source_has_audio:
-        cmd.extend(["-map", "0:a:0?"])
 
-    # Video: libx264 with veryfast preset, crf 23, yuv420p for universal Apple player decoding
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-    ])
+    if has_separate_audio:
+        cmd.extend(["-i", str(audio_path)])
+        cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
+    else:
+        cmd.extend(["-map", "0:v:0"])
+        if has_input_audio:
+            cmd.extend(["-map", "0:a:0"])
 
-    # Audio: preserve/copy if already AAC, otherwise encode to AAC at 192k
-    if probe.get("has_audio") or source_has_audio:
-        if probe.get("audio_codec") == "aac":
+    # Video: stream copy ONLY if already h264/avc1 with standard 8-bit yuv420p in mp4, else libx264 with yuv420p
+    if not has_separate_audio and probe.get("video_codec") in ("h264", "avc1") and probe.get("pix_fmt") == "yuv420p" and file_path.suffix.lower() == ".mp4":
+        cmd.extend(["-c:v", "copy"])
+    else:
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+        ])
+
+    # Audio: preserve/copy if already stereo/mono AAC, otherwise encode to AAC stereo at 192k
+    if has_separate_audio or has_input_audio:
+        a_probe = probe if not has_separate_audio else probe_media_detailed(audio_path)
+        a_codec = a_probe.get("audio_codec")
+        channels = a_probe.get("channels") or 2
+        if a_codec == "aac" and channels <= 2:
             cmd.extend(["-c:a", "copy"])
         else:
-            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ac", "2"])
 
     cmd.extend(["-movflags", "+faststart", str(norm_file)])
 
     tc_res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if tc_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
         final_probe = probe_media_detailed(norm_file)
-        if probe.get("has_audio") and not final_probe.get("has_audio"):
+        if (has_input_audio or has_separate_audio) and not final_probe.get("has_audio"):
             logger.error(f"iOS normalization dropped audio stream for {file_path.name}! Reverting to original file.")
             return file_path, probe
         logger.info(f"Successfully normalized {file_path.name} to iOS MP4 ({norm_file.name}, size={norm_file.stat().st_size})")
@@ -1018,10 +1304,11 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
     platform_info = detect_platform_from_url(url)
     has_ffmpeg = HAS_FFMPEG
 
+    is_instagram = bool(platform_info.key == "instagram")
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
+        "noplaylist": not is_instagram,  # Allow Instagram multi-item carousel extraction
         "extract_flat": False,
         "socket_timeout": 8,
         "http_headers": DEFAULT_HTTP_HEADERS,
@@ -1103,18 +1390,17 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
                     if not item_url:
                         item_url = entry.get("webpage_url") or entry.get("url") or url
                 else:
-                    valid_thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
-                    if valid_thumbs:
-                        best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                        item_url = best_thumb.get("url")
-                    elif entry.get("url"):
-                        item_url = entry.get("url")
+                    best_cand = select_best_photo_candidate(entry)
+                    item_url = best_cand.get("selected_url") or entry.get("url")
 
                 carousel_items.append({
                     "index": idx,
                     "id": entry.get("id", f"item_{idx}"),
                     "type": item_type,
                     "url": item_url,
+                    "width": best_cand.get("width") if item_type == "photo" else entry.get("width"),
+                    "height": best_cand.get("height") if item_type == "photo" else entry.get("height"),
+                    "aspect_ratio": best_cand.get("aspect_ratio") if item_type == "photo" else None,
                     "raw_entry": entry,
                 })
                 logger.info(
@@ -1135,13 +1421,8 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
 
             if not has_video:
                 media_type = "photo"
-                photo_url = None
-                valid_thumbs = [t for t in (info.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
-                if valid_thumbs:
-                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                    photo_url = best_thumb.get("url")
-                elif info.get("url"):
-                    photo_url = info.get("url")
+                best_cand = select_best_photo_candidate(info)
+                photo_url = best_cand.get("selected_url") or info.get("url")
                 logger.info("media_type: photo")
                 logger.info(f"image_url_available: {bool(photo_url)}")
                 available_qualities = ["photo"]
@@ -1184,10 +1465,24 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
 
         extraction_time_s = time.time() - t_start
 
+        preview_w = None
+        preview_h = None
+        if is_carousel and carousel_items:
+            preview_w = carousel_items[0].get("width") or primary_entry.get("width")
+            preview_h = carousel_items[0].get("height") or primary_entry.get("height")
+        elif not has_video:
+            preview_w = best_cand.get("width") or primary_entry.get("width")
+            preview_h = best_cand.get("height") or primary_entry.get("height")
+        else:
+            preview_w = primary_entry.get("width")
+            preview_h = primary_entry.get("height")
+
         # Store detected fields inside raw_info for cache restoration
         info["media_type"] = media_type
         info["is_carousel"] = is_carousel
         info["carousel_items"] = carousel_items
+        info["width"] = preview_w
+        info["height"] = preview_h
 
         media_info = MediaInfo(
             title=info.get("title", "Media"),
@@ -1195,8 +1490,8 @@ def _sync_extract_preview(url: str) -> tuple[bool, Optional[MediaInfo], Optional
             duration=info.get("duration"),
             thumbnail=info.get("thumbnail") or (carousel_items[0]["url"] if (carousel_items and carousel_items[0]["url"]) else None),
             filesize_approx=info.get("filesize") or info.get("filesize_approx"),
-            width=primary_entry.get("width"),
-            height=primary_entry.get("height"),
+            width=preview_w,
+            height=preview_h,
             webpage_url=info.get("webpage_url", url),
             platform=platform_info,
             available_qualities=available_qualities,
@@ -1379,12 +1674,8 @@ def _sync_download(
                         if not item_url:
                             item_url = entry.get("webpage_url") or entry.get("url") or url
                     else:
-                        valid_thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
-                        if valid_thumbs:
-                            best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                            item_url = best_thumb.get("url")
-                        elif entry.get("url"):
-                            item_url = entry.get("url")
+                        photo_cand = select_best_photo_candidate(entry, fallback_url=entry.get("url"))
+                        item_url = photo_cand.get("selected_url") or entry.get("url")
                     carousel_items.append({
                         "index": idx,
                         "id": entry.get("id", f"item_{idx}"),
@@ -1415,7 +1706,11 @@ def _sync_download(
 
             if itype == "photo":
                 try:
-                    req = urllib.request.Request(iurl, headers=DEFAULT_HTTP_HEADERS)
+                    raw_e = it.get("raw_entry") or {}
+                    photo_cand = select_best_photo_candidate(raw_e, fallback_url=iurl)
+                    target_url = photo_cand.get("selected_url") or iurl
+
+                    req = urllib.request.Request(target_url, headers=DEFAULT_HTTP_HEADERS)
                     with urllib.request.urlopen(req, timeout=20) as resp:
                         ctype = resp.headers.get("Content-Type", "")
                         ext = ".webp" if "webp" in ctype else (".png" if "png" in ctype else ".jpg")
@@ -1424,6 +1719,26 @@ def _sync_download(
                             f.write(resp.read())
                         item_size = item_file.stat().st_size
                         if item_file.exists() and item_size > 0:
+                            pil_w, pil_h = inspect_image_dimensions(item_file)
+                            src_w = photo_cand.get("width") or pil_w
+                            src_h = photo_cand.get("height") or pil_h
+                            dl_w = pil_w or src_w
+                            dl_h = pil_h or src_h
+                            actual_ar = round(dl_w / dl_h, 4) if (dl_w and dl_h and dl_h > 0) else None
+                            c_count = photo_cand.get("source_candidates", 1)
+
+                            # 7 MANDATORY PHOTO DEBUG LOGS FOR CAROUSEL ITEM
+                            logger.info(f"[PHOTO DEBUG] selected_url={target_url}")
+                            logger.info(f"[PHOTO DEBUG] source_width={src_w}")
+                            logger.info(f"[PHOTO DEBUG] source_height={src_h}")
+                            logger.info(f"[PHOTO DEBUG] downloaded_width={dl_w}")
+                            logger.info(f"[PHOTO DEBUG] downloaded_height={dl_h}")
+                            logger.info(f"[PHOTO DEBUG] aspect_ratio={actual_ar}")
+                            logger.info(f"[PHOTO DEBUG] candidate_count={c_count}")
+                            logger.info(f"[PHOTO DEBUG] width={dl_w}")
+                            logger.info(f"[PHOTO DEBUG] height={dl_h}")
+                            logger.info(f"[PHOTO DEBUG] source_candidates={c_count}")
+
                             logger.info("carousel item download success: True")
                             logger.info(f"carousel item local path: {item_file}")
                             carousel_files.append(("photo", item_file))
@@ -1446,7 +1761,7 @@ def _sync_download(
                     if raw_entry and entry_has_audio and ffmpeg_bin:
                         try:
                             v_ydl_opts = {
-                                "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best",
+                                "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]",
                                 "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
                                 "merge_output_format": "mp4",
                                 "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
@@ -1637,16 +1952,10 @@ def _sync_download(
     if quality == "photo" or media_type == "photo":
         logger.info("Entering dedicated photo download pipeline (no video formats)")
         photo_url = None
+        photo_cand = {}
         if cached_info:
-            if cached_info.get("thumbnails"):
-                valid_thumbs = [t for t in cached_info["thumbnails"] if isinstance(t, dict) and t.get("url")]
-                if valid_thumbs:
-                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                    photo_url = best_thumb.get("url")
-                else:
-                    photo_url = cached_info["thumbnails"][-1].get("url")
-            elif cached_info.get("url"):
-                photo_url = cached_info.get("url")
+            photo_cand = select_best_photo_candidate(cached_info, fallback_url=cached_info.get("url"))
+            photo_url = photo_cand.get("selected_url")
 
         if not photo_url:
             # Fallback extraction of image URL
@@ -1672,22 +1981,16 @@ def _sync_download(
                                 cached_info=raw_p,
                             )
                         e0 = entries_p[0]
-                        if e0.get("thumbnails"):
-                            valid_thumbs = [t for t in e0["thumbnails"] if isinstance(t, dict) and t.get("url")]
-                            if valid_thumbs:
-                                best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                                photo_url = best_thumb.get("url")
-                            else:
-                                photo_url = e0["thumbnails"][-1].get("url")
-                        elif e0.get("url"):
-                            photo_url = e0.get("url")
+                        photo_cand = select_best_photo_candidate(e0, fallback_url=e0.get("url"))
+                        photo_url = photo_cand.get("selected_url")
             except Exception as e:
                 logger.warning(f"Photo URL fallback error: {e}")
 
         if not photo_url and platform_info.key == "instagram":
             fb_info = _extract_instagram_embed_fallback(url)
-            if fb_info and fb_info.get("url"):
-                photo_url = fb_info["url"]
+            if fb_info:
+                photo_cand = select_best_photo_candidate(fb_info, fallback_url=fb_info.get("url"))
+                photo_url = photo_cand.get("selected_url")
 
         logger.info("media_type: photo")
         logger.info(f"image_url_available: {bool(photo_url)}")
@@ -1713,6 +2016,35 @@ def _sync_download(
                     f.write(data)
 
                 d_size = len(data)
+                if not photo_file.exists() or d_size == 0:
+                    record_download_finish(success=False)
+                    return DownloadResult(
+                        success=False,
+                        error_code="PHOTO_DOWNLOAD_FAILED",
+                        error_message="❌ Photo download failed (0 bytes received).",
+                        temp_dir=temp_dir,
+                    )
+
+                pil_w, pil_h = inspect_image_dimensions(photo_file)
+                src_w = photo_cand.get("width") or pil_w
+                src_h = photo_cand.get("height") or pil_h
+                dl_w = pil_w or src_w
+                dl_h = pil_h or src_h
+                actual_ar = round(dl_w / dl_h, 4) if (dl_w and dl_h and dl_h > 0) else None
+                c_count = photo_cand.get("source_candidates", 1)
+
+                # 7 MANDATORY PHOTO DEBUG LOGS FOR SINGLE PHOTO
+                logger.info(f"[PHOTO DEBUG] selected_url={photo_url}")
+                logger.info(f"[PHOTO DEBUG] source_width={src_w}")
+                logger.info(f"[PHOTO DEBUG] source_height={src_h}")
+                logger.info(f"[PHOTO DEBUG] downloaded_width={dl_w}")
+                logger.info(f"[PHOTO DEBUG] downloaded_height={dl_h}")
+                logger.info(f"[PHOTO DEBUG] aspect_ratio={actual_ar}")
+                logger.info(f"[PHOTO DEBUG] candidate_count={c_count}")
+                logger.info(f"[PHOTO DEBUG] width={dl_w}")
+                logger.info(f"[PHOTO DEBUG] height={dl_h}")
+                logger.info(f"[PHOTO DEBUG] source_candidates={c_count}")
+
                 logger.info(f"canonical URL: {url}")
                 logger.info("extractor result type: photo")
                 logger.info("format count: 1")
@@ -1724,15 +2056,6 @@ def _sync_download(
                 logger.info(f"downloaded size: {d_size} bytes")
                 logger.info(f"final image path: {photo_file}")
 
-                if not photo_file.exists() or d_size == 0:
-                    record_download_finish(success=False)
-                    return DownloadResult(
-                        success=False,
-                        error_code="PHOTO_DOWNLOAD_FAILED",
-                        error_message="❌ Photo download failed (0 bytes received).",
-                        temp_dir=temp_dir,
-                    )
-
                 record_download_finish(success=True)
                 media_info = MediaInfo(
                     title=(cached_info.get("title") if cached_info else None) or "Photo",
@@ -1740,8 +2063,8 @@ def _sync_download(
                     duration=None,
                     thumbnail=photo_url,
                     filesize_approx=d_size,
-                    width=None,
-                    height=None,
+                    width=dl_w,
+                    height=dl_h,
                     webpage_url=url,
                     platform=platform_info,
                     available_qualities=["photo"],
@@ -1811,11 +2134,12 @@ def _sync_download(
             if pp_start_time[0] > 0:
                 ffmpeg_processing_time[0] += time.time() - pp_start_time[0]
 
+    is_instagram = bool(platform_info and platform_info.key == "instagram")
     ydl_opts = {
         "format": format_spec,
         "outtmpl": outtmpl_pattern,
         "max_filesize": MAX_FILE_SIZE_BYTES,
-        "noplaylist": True,
+        "noplaylist": not is_instagram,
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
@@ -1826,7 +2150,6 @@ def _sync_download(
         "extract_flat": False,
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 1024,
-        "http_chunk_size": 10485760,
         "http_headers": DEFAULT_HTTP_HEADERS,
         "extractor_args": {
             "youtube": {
@@ -1909,15 +2232,8 @@ def _sync_download(
                             if not item_url:
                                 item_url = entry.get("webpage_url") or entry.get("url") or url
                         else:
-                            if entry.get("thumbnails"):
-                                valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
-                                if valid_thumbs:
-                                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                                    item_url = best_thumb.get("url")
-                                else:
-                                    item_url = entry["thumbnails"][-1].get("url")
-                            elif entry.get("url"):
-                                item_url = entry.get("url")
+                            photo_cand = select_best_photo_candidate(entry, fallback_url=entry.get("url"))
+                            item_url = photo_cand.get("selected_url") or entry.get("url")
                         carousel_items.append({
                             "index": idx,
                             "id": entry.get("id", f"item_{idx}"),
@@ -2174,25 +2490,57 @@ def _sync_download(
                 # Format identification for AUDIO DEBUG
                 selected_v_fmt = "unknown"
                 selected_a_fmt = "none"
+                source_vcodec = info_dict.get("vcodec") or "unknown"
+                source_acodec = info_dict.get("acodec") or ("none" if not source_has_audio else "unknown")
+
                 req_fmts = info_dict.get("requested_formats")
                 if req_fmts:
-                    v_f = next((f.get("format_id") for f in req_fmts if f.get("vcodec") != "none"), None)
-                    a_f = next((f.get("format_id") for f in req_fmts if f.get("acodec") != "none" or (f.get("audio_ext") and f.get("audio_ext") != "none")), None)
-                    selected_v_fmt = v_f or info_dict.get("format_id") or "unknown"
-                    selected_a_fmt = a_f or "embedded"
+                    v_f = next((f for f in req_fmts if f.get("vcodec") != "none"), None)
+                    a_f = next((f for f in req_fmts if f.get("acodec") != "none" or (f.get("audio_ext") and f.get("audio_ext") != "none")), None)
+                    if v_f:
+                        selected_v_fmt = v_f.get("format_id") or "unknown"
+                        source_vcodec = v_f.get("vcodec") or source_vcodec
+                    if a_f:
+                        selected_a_fmt = a_f.get("format_id") or "embedded"
+                        source_acodec = a_f.get("acodec") or source_acodec
+                    if not v_f:
+                        selected_v_fmt = info_dict.get("format_id") or "unknown"
                 else:
                     selected_v_fmt = info_dict.get("format_id") or "unknown"
                     if _has_audio_in_format(info_dict) or source_has_audio:
                         selected_a_fmt = "embedded" if has_a_stream else "none"
 
-                # 7 MANDATORY DIAGNOSTIC LOGS
+                ffmpeg_ran = bool(ffmpeg_merge_status not in ("none", "direct")) or bool(norm_probe.get("is_ios_compatible") is False)
+
+                # 13 MANDATORY [AUDIO DEBUG] DIAGNOSTIC LOGS
+                logger.info(f"[AUDIO DEBUG] source={url}")
+                logger.info(f"[AUDIO DEBUG] selected_format={info_dict.get('format_id') or format_spec}")
+                logger.info(f"[AUDIO DEBUG] video_format={selected_v_fmt}")
+                logger.info(f"[AUDIO DEBUG] audio_format={selected_a_fmt}")
+                logger.info(f"[AUDIO DEBUG] source_vcodec={source_vcodec}")
+                logger.info(f"[AUDIO DEBUG] source_acodec={source_acodec}")
+                logger.info(f"[AUDIO DEBUG] audio_downloaded={downloaded_audio_detected}")
+                logger.info(f"[AUDIO DEBUG] ffmpeg_started={ffmpeg_ran}")
+                logger.info(f"[AUDIO DEBUG] ffmpeg_result={ffmpeg_merge_status}")
+                logger.info(f"[AUDIO DEBUG] final_vcodec={video_codec}")
+                logger.info(f"[AUDIO DEBUG] final_acodec={audio_codec}")
+                logger.info(f"[AUDIO DEBUG] final_video_stream={has_v_stream}")
+                logger.info(f"[AUDIO DEBUG] final_audio_stream={has_a_stream}")
+
+                # Also retain backwards-compatible keys
                 logger.info(f"[AUDIO DEBUG] source_has_audio={source_has_audio}")
                 logger.info(f"[AUDIO DEBUG] selected_video_format={selected_v_fmt}")
                 logger.info(f"[AUDIO DEBUG] selected_audio_format={selected_a_fmt}")
                 logger.info(f"[AUDIO DEBUG] downloaded_audio={downloaded_audio_detected}")
                 logger.info(f"[AUDIO DEBUG] ffmpeg_merge={ffmpeg_merge_status}")
-                logger.info(f"[AUDIO DEBUG] final_video_stream={has_v_stream}")
-                logger.info(f"[AUDIO DEBUG] final_audio_stream={has_a_stream}")
+
+                # MANDATORY FINAL VALIDATION LOGS
+                v_dur = norm_probe.get("duration") or info_dict.get("duration")
+                logger.info(f"VIDEO STREAM = {'TRUE' if has_v_stream else 'FALSE'}")
+                logger.info(f"AUDIO STREAM = {'TRUE' if has_a_stream else 'FALSE'}")
+                logger.info(f"final_video_codec={video_codec}")
+                logger.info(f"final_audio_codec={audio_codec}")
+                logger.info(f"final_duration={v_dur}")
 
                 # Validation per iOS & Audio requirements:
                 if not has_v_stream:
@@ -2334,15 +2682,8 @@ def _sync_download(
                             if not item_url:
                                 item_url = entry.get("webpage_url") or entry.get("url") or url
                         else:
-                            if entry.get("thumbnails"):
-                                valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
-                                if valid_thumbs:
-                                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                                    item_url = best_thumb.get("url")
-                                else:
-                                    item_url = entry["thumbnails"][-1].get("url")
-                            elif entry.get("url"):
-                                item_url = entry.get("url")
+                            photo_cand = select_best_photo_candidate(entry, fallback_url=entry.get("url"))
+                            item_url = photo_cand.get("selected_url") or entry.get("url")
                         carousel_items.append({
                             "index": idx,
                             "id": entry.get("id", f"item_{idx}"),

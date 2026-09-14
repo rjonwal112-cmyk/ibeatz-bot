@@ -87,7 +87,10 @@ async def admin_callback_handler(callback: CallbackQuery) -> None:
     elif action == "cache":
         await admin_cache_handler(callback.message)
     elif action == "maint":
-        await admin_maintenance_handler(callback.message)
+        await callback.message.answer(
+            _format_maintenance_text(),
+            reply_markup=_build_maintenance_keyboard(),
+        )
     elif action == "errors":
         await admin_errors_handler(callback.message)
 
@@ -201,11 +204,42 @@ async def admin_cache_handler(message: Message) -> None:
     await status_msg.edit_text(report)
 
 
+def _build_maintenance_keyboard() -> Any:
+    """Builds inline keyboard for maintenance management."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Enable Maintenance", callback_data="maint:enable")
+    builder.button(text="❌ Disable Maintenance", callback_data="maint:disable")
+    builder.button(text="ℹ️ Status", callback_data="maint:status")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _format_maintenance_text() -> str:
+    """Formats current maintenance state message."""
+    active = is_maintenance_mode()
+    state_str = "🔴 <b>ENABLED</b>" if active else "🟢 <b>DISABLED</b>"
+    desc_str = (
+        "• <b>Status:</b> Regular user downloads are <b>BLOCKED</b>.\n"
+        "• <b>Admin Access:</b> Admins can still test and download media.\n"
+        "• <b>Queue:</b> New normal-user jobs are rejected before queueing."
+        if active
+        else "• <b>Status:</b> All normal downloads and features are <b>ACTIVE</b>."
+    )
+    return (
+        "🛠 <b>Bot Maintenance Control Panel</b>\n\n"
+        f"• <b>Current State:</b> {state_str}\n"
+        f"{desc_str}\n\n"
+        "<i>Tap a button below to update or refresh maintenance state:</i>"
+    )
+
+
 @admin_router.message(Command("maintenance", ignore_case=True))
 async def admin_maintenance_handler(message: Message) -> None:
-    """Toggles bot maintenance mode persistently."""
+    """Shows current maintenance status and controls (Admin only)."""
     user_id = message.from_user.id if message.from_user else 0
     if not is_admin(user_id):
+        chat_id = message.chat.id if getattr(message, "chat", None) else None
+        logger.warning(f"Unauthorized /maintenance attempt from user_id={user_id}, chat_id={chat_id}, ADMIN_IDS={ADMIN_IDS}")
         await message.reply("⛔ This command is restricted to bot administrators.")
         return
 
@@ -213,19 +247,66 @@ async def admin_maintenance_handler(message: Message) -> None:
     parts = text.split()
     if len(parts) > 1:
         arg = parts[1]
-        if arg in ("off", "disable", "stop", "0", "false"):
-            new_state = False
-        elif arg in ("on", "enable", "start", "1", "true"):
-            new_state = True
-        else:
-            new_state = not is_maintenance_mode()
-    else:
-        new_state = not is_maintenance_mode()
+        if arg in ("on", "enable", "start", "1", "true"):
+            if not is_maintenance_mode():
+                await set_maintenance_mode(True)
+                logger.info(f"MAINTENANCE ENABLED by {user_id}")
+            else:
+                logger.info(f"MAINTENANCE ENABLED by {user_id} (already active)")
+        elif arg in ("off", "disable", "stop", "0", "false"):
+            if is_maintenance_mode():
+                await set_maintenance_mode(False)
+                logger.info(f"MAINTENANCE DISABLED by {user_id}")
+            else:
+                logger.info(f"MAINTENANCE DISABLED by {user_id} (already inactive)")
 
-    await set_maintenance_mode(new_state)
-    state_str = "🔴 ENABLED (Bot is paused for users)" if new_state else "🟢 DISABLED (Bot is normal operational)"
-    logger.info(f"Maintenance mode set to {new_state} by admin {user_id}")
-    await message.answer(f"🛠 <b>Maintenance Mode:</b> {state_str}")
+    await message.answer(
+        _format_maintenance_text(),
+        reply_markup=_build_maintenance_keyboard(),
+    )
+
+
+@admin_router.callback_query(F.data.startswith("maint:"))
+async def maintenance_callback_handler(callback: CallbackQuery) -> None:
+    """Handles maintenance inline keyboard actions (Admin only)."""
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        logger.warning(f"Unauthorized maintenance callback from user_id={user_id}, ADMIN_IDS={ADMIN_IDS}")
+        await callback.answer("⛔ Unauthorized: Admin access required.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "enable":
+        if not is_maintenance_mode():
+            await set_maintenance_mode(True)
+            logger.info(f"MAINTENANCE ENABLED by {user_id}")
+            toast = "✅ Maintenance mode ENABLED."
+        else:
+            toast = "ℹ️ Maintenance mode is already ENABLED."
+    elif action == "disable":
+        if is_maintenance_mode():
+            await set_maintenance_mode(False)
+            logger.info(f"MAINTENANCE DISABLED by {user_id}")
+            toast = "❌ Maintenance mode DISABLED."
+        else:
+            toast = "ℹ️ Maintenance mode is already DISABLED."
+    elif action == "status":
+        curr = "ENABLED" if is_maintenance_mode() else "DISABLED"
+        toast = f"ℹ️ Current State: {curr}"
+    else:
+        toast = "Unknown action."
+
+    await callback.answer(toast, show_alert=False)
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                _format_maintenance_text(),
+                reply_markup=_build_maintenance_keyboard(),
+            )
+        except Exception:
+            pass
 
 
 @admin_router.message(Command("errors", ignore_case=True))
