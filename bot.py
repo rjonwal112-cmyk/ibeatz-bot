@@ -257,6 +257,16 @@ async def main() -> None:
     await db.initialize()
     await init_stats()
 
+    # Clear stale cache so all deliveries use fresh, audio-verified downloads
+    try:
+        purged = await db.purge_all_cache()
+        for f in CACHE_DIR.glob("*"):
+            if f.is_file():
+                f.unlink(missing_ok=True)
+        logger.info(f"🧹 [STARTUP] Purged {purged} stale cache entries and cleaned cache directory.")
+    except Exception as cache_purge_err:
+        logger.warning(f"Could not purge cache on startup: {cache_purge_err}")
+
     # 4. Run FFmpeg environment diagnostics
     log_startup_system_report()
 

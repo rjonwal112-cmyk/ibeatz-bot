@@ -302,15 +302,25 @@ def _is_video_format(f: dict) -> bool:
 
 def _has_audio_in_format(f: dict) -> bool:
     """Checks if a format dictionary contains audio."""
+    if not isinstance(f, dict):
+        return False
     acodec = f.get("acodec")
     if acodec == "none":
         return False
     if acodec:
         return True
+    audio_ext = (f.get("audio_ext") or "").lower()
+    if audio_ext == "none" and f.get("vcodec") and f.get("vcodec") != "none":
+        return False
+    if audio_ext and audio_ext != "none":
+        return True
     ext = (f.get("ext") or "").lower()
     if ext in ("m4a", "mp3", "opus", "aac", "ogg", "wav", "flac"):
         return True
-    if f.get("format_id") in ("sd", "hd") or ext in ("mp4", "webm", "mkv"):
+    if f.get("format_id") in ("sd", "hd"):
+        return True
+    # Progressive mp4/webm/mkv streams without explicit codecs (e.g. IG formats 1, 2, 3)
+    if ext in ("mp4", "webm", "mkv") and f.get("vcodec") not in ("none",) and f.get("acodec") not in ("none",):
         return True
     return False
 
@@ -455,20 +465,9 @@ def _build_format_options(
     if plat_key in ("instagram", "facebook"):
         if has_ffmpeg:
             merge_output_format = "mp4"
-            format_spec = (
-                "bestvideo+bestaudio/"
-                "best[vcodec!=none][acodec!=none]/"
-                "best[acodec!=none]/"
-                "best[vcodec!=none]/"
-                "best"
-            )
+            format_spec = "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best"
         else:
-            format_spec = (
-                "best[vcodec!=none][acodec!=none]/"
-                "best[acodec!=none]/"
-                "best[vcodec!=none]/"
-                "best"
-            )
+            format_spec = "best[vcodec!=none][acodec!=none]/best"
         return format_spec, postprocessors, merge_output_format
 
     # YouTube and generic platforms for 'highest' / 'best':
@@ -481,22 +480,14 @@ def _build_format_options(
                 "bestvideo[height<=1080]+bestaudio/"
                 "bestvideo+bestaudio/"
                 "best[height<=1080][vcodec!=none][acodec!=none]/"
-                "best[height<=1080][acodec!=none]/"
                 "best[vcodec!=none][acodec!=none]/"
-                "best[acodec!=none]/"
-                "best[height<=1080][vcodec!=none]/"
-                "best[vcodec!=none]/"
                 "best"
             )
         else:
             format_spec = (
                 "22/18/"
                 "best[height<=1080][vcodec!=none][acodec!=none]/"
-                "best[height<=1080][acodec!=none]/"
                 "best[vcodec!=none][acodec!=none]/"
-                "best[acodec!=none]/"
-                "best[height<=1080][vcodec!=none]/"
-                "best[vcodec!=none]/"
                 "best"
             )
         return format_spec, postprocessors, merge_output_format
@@ -518,11 +509,7 @@ def _build_format_options(
                 f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
-                f"best[height<={h_val}][acodec!=none]/"
                 f"best[vcodec!=none][acodec!=none]/"
-                f"best[acodec!=none]/"
-                f"best[height<={h_val}][vcodec!=none]/"
-                f"best[vcodec!=none]/"
                 "best"
             )
         else:
@@ -531,11 +518,7 @@ def _build_format_options(
                 f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
-                f"best[height<={h_val}][acodec!=none]/"
                 f"best[vcodec!=none][acodec!=none]/"
-                f"best[acodec!=none]/"
-                f"best[height<={h_val}][vcodec!=none]/"
-                f"best[vcodec!=none]/"
                 "best"
             )
     else:
@@ -550,11 +533,7 @@ def _build_format_options(
                 f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
-                f"best[height<={h_val}][acodec!=none]/"
                 f"best[vcodec!=none][acodec!=none]/"
-                f"best[acodec!=none]/"
-                f"best[height<={h_val}][vcodec!=none]/"
-                f"best[vcodec!=none]/"
                 "best"
             )
         else:
@@ -562,11 +541,7 @@ def _build_format_options(
                 f"best[height<={h_val}][height>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[width<={h_val}][width>{h_min}][vcodec!=none][acodec!=none]/"
                 f"best[height<={h_val}][vcodec!=none][acodec!=none]/"
-                f"best[height<={h_val}][acodec!=none]/"
                 f"best[vcodec!=none][acodec!=none]/"
-                f"best[acodec!=none]/"
-                f"best[height<={h_val}][vcodec!=none]/"
-                f"best[vcodec!=none]/"
                 "best"
             )
 
@@ -837,8 +812,37 @@ def probe_media_streams(file_path: Optional[Path]) -> tuple[bool, bool]:
     Probes file using ffprobe or ffmpeg to verify whether video and audio streams exist.
     Returns: (has_video_stream, has_audio_stream)
     """
+    info = probe_media_detailed(file_path)
+    return info["has_video"], info["has_audio"]
+
+
+def probe_media_detailed(file_path: Optional[Path]) -> dict:
+    """
+    Probes file using ffprobe to extract codec names, container format, and stream presence.
+    Returns:
+    {
+        "has_video": bool,
+        "has_audio": bool,
+        "video_codec": Optional[str],  # normalized lowercase e.g. "h264", "vp9", "av1"
+        "audio_codec": Optional[str],  # normalized lowercase e.g. "aac", "opus", "mp3"
+        "container": Optional[str],    # e.g. "mov,mp4,m4a,3gp,3g2,mj2" or "mp4"
+        "width": Optional[int],
+        "height": Optional[int],
+        "is_ios_compatible": bool,
+    }
+    """
+    info = {
+        "has_video": False,
+        "has_audio": False,
+        "video_codec": None,
+        "audio_codec": None,
+        "container": None,
+        "width": None,
+        "height": None,
+        "is_ios_compatible": False,
+    }
     if not file_path or not file_path.exists() or file_path.stat().st_size == 0:
-        return False, False
+        return info
 
     ffmpeg_bin = resolve_ffmpeg_path()
     ffprobe_bin = None
@@ -856,33 +860,155 @@ def probe_media_streams(file_path: Optional[Path]) -> tuple[bool, bool]:
             cmd = [
                 ffprobe_bin,
                 "-v", "error",
-                "-show_entries", "stream=codec_type",
+                "-show_entries", "stream=index,codec_type,codec_name,width,height:format=format_name",
                 "-of", "json",
                 str(file_path),
             ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if res.returncode == 0 and res.stdout.strip():
                 data = json.loads(res.stdout)
                 streams = data.get("streams", [])
-                has_video = any(s.get("codec_type") == "video" for s in streams)
-                has_audio = any(s.get("codec_type") == "audio" for s in streams)
-                return has_video, has_audio
-        except Exception as probe_err:
-            logger.debug(f"ffprobe check failed for {file_path}: {probe_err}")
+                fmt = data.get("format", {})
+                info["container"] = fmt.get("format_name") or file_path.suffix.lstrip(".").lower()
 
-    if ffmpeg_bin and Path(ffmpeg_bin).exists():
+                for s in streams:
+                    ctype = s.get("codec_type")
+                    cname = (s.get("codec_name") or "").lower()
+                    if ctype == "video" and not info["has_video"]:
+                        info["has_video"] = True
+                        info["video_codec"] = cname
+                        info["width"] = s.get("width")
+                        info["height"] = s.get("height")
+                    elif ctype == "audio" and not info["has_audio"]:
+                        info["has_audio"] = True
+                        info["audio_codec"] = cname
+        except Exception as probe_err:
+            logger.debug(f"ffprobe detailed check failed for {file_path}: {probe_err}")
+
+    # Fallback to basic ffmpeg probing if ffprobe was unavailable or failed
+    if not info["has_video"] and not info["has_audio"] and ffmpeg_bin and Path(ffmpeg_bin).exists():
         try:
             cmd = [ffmpeg_bin, "-i", str(file_path)]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             output = res.stderr.lower()
-            has_video = "video:" in output or ("stream #0:" in output and "video" in output)
-            has_audio = "audio:" in output or ("stream #0:" in output and "audio" in output)
-            return has_video, has_audio
+            info["has_video"] = "video:" in output or ("stream #0:" in output and "video" in output)
+            info["has_audio"] = "audio:" in output or ("stream #0:" in output and "audio" in output)
+            if "h264" in output:
+                info["video_codec"] = "h264"
+            elif "vp9" in output:
+                info["video_codec"] = "vp9"
+            elif "av1" in output:
+                info["video_codec"] = "av1"
+            if "aac" in output:
+                info["audio_codec"] = "aac"
+            elif "opus" in output:
+                info["audio_codec"] = "opus"
         except Exception:
             pass
 
-    ext = file_path.suffix.lower()
-    return ext in (".mp4", ".mkv", ".webm", ".mov"), ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".aac")
+    if not info["container"]:
+        info["container"] = file_path.suffix.lstrip(".").lower()
+
+    # Evaluate iOS compatibility:
+    # 1. Container must be MP4 (or mov,mp4 container format)
+    # 2. Video codec must be h264 / avc1 (NEVER vp9 or av1)
+    # 3. Audio codec (if present) must be aac
+    v_ok = bool(info["has_video"] and info["video_codec"] in ("h264", "avc1"))
+    a_ok = bool(not info["has_audio"] or info["audio_codec"] == "aac")
+    c_ok = bool(info["container"] and ("mp4" in info["container"] or file_path.suffix.lower() == ".mp4"))
+    info["is_ios_compatible"] = bool(v_ok and a_ok and c_ok)
+
+    return info
+
+
+def normalize_video_for_ios(
+    file_path: Path,
+    source_has_audio: bool = True,
+    temp_dir: Optional[Path] = None,
+) -> tuple[Path, dict]:
+    """
+    Normalizes any video file to an iOS-compatible MP4 container (H.264 + AAC) with faststart.
+    - If already iOS-compatible (H.264 + AAC MP4): stream-copy / remux with faststart.
+    - If video is VP9/AV1/etc. or audio is not AAC: transcode via FFmpeg (libx264 + aac).
+    - Explicitly maps streams: -map 0:v:0 -map 0:a:0?
+    Returns: (final_file_path, probe_info)
+    """
+    if not file_path or not file_path.exists():
+        return file_path, {}
+
+    ffmpeg_bin = resolve_ffmpeg_path()
+    if not ffmpeg_bin:
+        logger.warning(f"FFmpeg not available, cannot normalize {file_path.name} for iOS")
+        return file_path, probe_media_detailed(file_path)
+
+    probe = probe_media_detailed(file_path)
+    logger.info(
+        f"[iOS COMPATIBILITY CHECK] input={file_path.name}, vcodec={probe.get('video_codec')}, "
+        f"acodec={probe.get('audio_codec')}, container={probe.get('container')}, "
+        f"is_ios_compatible={probe.get('is_ios_compatible')}"
+    )
+
+    # Determine destination directory and target output path
+    target_dir = temp_dir or file_path.parent
+    norm_file = target_dir / f"{file_path.stem}_ios.mp4"
+
+    # Case 1: Already H.264 + AAC MP4 -> Stream copy / remux with faststart
+    if probe.get("is_ios_compatible") and file_path.suffix.lower() == ".mp4":
+        logger.info(f"File {file_path.name} is already iOS-compatible (H.264 + AAC MP4). Remuxing with faststart...")
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+        ]
+        if probe.get("has_audio"):
+            cmd.extend(["-map", "0:a:0?"])
+        cmd.extend(["-c", "copy", "-movflags", "+faststart", str(norm_file)])
+
+        remux_res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if remux_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
+            final_probe = probe_media_detailed(norm_file)
+            return norm_file, final_probe
+        else:
+            logger.warning(f"Fast remux failed ({remux_res.stderr}), proceeding to transcode")
+
+    # Case 2: Transcode incompatible video (VP9 / AV1 / non-AAC / non-MP4)
+    logger.info(f"Normalizing incompatible video {file_path.name} (codec={probe.get('video_codec')}) to H.264 + AAC MP4 for iOS...")
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(file_path),
+        "-map", "0:v:0",
+    ]
+    if probe.get("has_audio") or source_has_audio:
+        cmd.extend(["-map", "0:a:0?"])
+
+    # Video: libx264 with veryfast preset, crf 23, yuv420p for universal Apple player decoding
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+    ])
+
+    # Audio: preserve/copy if already AAC, otherwise encode to AAC at 192k
+    if probe.get("has_audio") or source_has_audio:
+        if probe.get("audio_codec") == "aac":
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+
+    cmd.extend(["-movflags", "+faststart", str(norm_file)])
+
+    tc_res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if tc_res.returncode == 0 and norm_file.exists() and norm_file.stat().st_size > 0:
+        final_probe = probe_media_detailed(norm_file)
+        if probe.get("has_audio") and not final_probe.get("has_audio"):
+            logger.error(f"iOS normalization dropped audio stream for {file_path.name}! Reverting to original file.")
+            return file_path, probe
+        logger.info(f"Successfully normalized {file_path.name} to iOS MP4 ({norm_file.name}, size={norm_file.stat().st_size})")
+        return norm_file, final_probe
+    else:
+        logger.error(f"FFmpeg iOS normalization failed: {tc_res.stderr}")
+        return file_path, probe
 
 
 
@@ -1320,7 +1446,7 @@ def _sync_download(
                     if raw_entry and entry_has_audio and ffmpeg_bin:
                         try:
                             v_ydl_opts = {
-                                "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best[vcodec!=none]/best",
+                                "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best",
                                 "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
                                 "merge_output_format": "mp4",
                                 "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
@@ -1356,7 +1482,7 @@ def _sync_download(
 
                     if not downloaded_ok:
                         v_ydl_opts = {
-                            "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best[vcodec!=none]/best",
+                            "format": "bestvideo+bestaudio/best[vcodec!=none][acodec!=none]/best",
                             "outtmpl": str(temp_dir / f"carousel_{idx}_%(id)s.%(ext)s"),
                             "merge_output_format": "mp4",
                             "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]},
@@ -1415,14 +1541,37 @@ def _sync_download(
                             except Exception as m_err:
                                 logger.error(f"Carousel emergency audio merge failed: {m_err}", exc_info=True)
 
+                        # Normalize to iOS-compatible H.264 + AAC MP4 with faststart
+                        item_file, item_probe = normalize_video_for_ios(
+                            item_file, source_has_audio=entry_has_audio, temp_dir=temp_dir
+                        )
+                        has_v = item_probe.get("has_video", False)
+                        has_a = item_probe.get("has_audio", False)
+
                         logger.info("carousel item download success: True")
                         logger.info(f"carousel item video stream: {'YES' if has_v else 'NO'}")
                         logger.info(f"carousel item audio stream: {'YES' if has_a else 'NO'}")
-                        if not entry_has_audio and not has_a:
-                            logger.info("AUDIO SOURCE: unavailable")
-                            logger.info(f"AUDIO CHECK: video={has_v} audio=False")
+                        logger.info(f"VIDEO CHECK: codec={item_probe.get('video_codec')}")
+                        if has_a:
+                            logger.info(f"AUDIO CHECK: codec={item_probe.get('audio_codec')}")
+                            logger.info("CONTAINER CHECK: mp4")
+                            logger.info("STREAMS: video=True audio=True")
                         else:
-                            logger.info(f"AUDIO CHECK: video={has_v} audio={has_a}")
+                            logger.info("AUDIO SOURCE: unavailable")
+                            logger.info(f"AUDIO CHECK: codec={item_probe.get('audio_codec') or 'none'}")
+                            logger.info("CONTAINER CHECK: mp4")
+                            logger.info("STREAMS: video=True audio=False")
+
+                        # Validate carousel video item criteria
+                        if not has_v:
+                            logger.error(f"Carousel item {idx} validation failed: video stream missing")
+                        if entry_has_audio and not has_a:
+                            logger.error(f"Carousel item {idx} validation failed: audio stream missing")
+                        if item_probe.get("video_codec") in ("vp9", "vp8", "av1", "av01"):
+                            logger.error(f"Carousel item {idx} validation failed: incompatible codec {item_probe.get('video_codec')}")
+                        if not item_probe.get("container") or "mp4" not in str(item_probe.get("container", "")):
+                            logger.error(f"Carousel item {idx} validation failed: container {item_probe.get('container')}")
+
                         logger.info(f"carousel item local path: {item_file}")
                         carousel_files.append(("video", item_file))
                     else:
@@ -1846,7 +1995,56 @@ def _sync_download(
                     temp_dir=temp_dir,
                 )
 
-            downloaded_file = downloaded_files[0]
+            # Group candidate files in temp_dir by type
+            video_files = [
+                f for f in downloaded_files
+                if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
+            ]
+            audio_files = [
+                f for f in downloaded_files
+                if f.suffix.lower() in (".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav", ".flac")
+            ]
+
+            ffmpeg_merge_status = "direct"
+            downloaded_audio_detected = False
+
+            if video_files and audio_files and ffmpeg_bin:
+                v_cand = video_files[0]
+                a_cand = audio_files[0]
+                has_v, has_a = probe_media_streams(v_cand)
+                downloaded_audio_detected = True
+                if not has_a:
+                    logger.info(
+                        f"Separate video ({v_cand.name}) and audio ({a_cand.name}) detected in temp_dir! "
+                        "Merging into single MP4..."
+                    )
+                    merged_out = temp_dir / f"merged_{uuid.uuid4().hex[:6]}.mp4"
+                    cmd = [
+                        ffmpeg_bin, "-y",
+                        "-i", str(v_cand),
+                        "-i", str(a_cand),
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        str(merged_out),
+                    ]
+                    m_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                    if m_proc.returncode == 0 and merged_out.exists() and merged_out.stat().st_size > 0:
+                        downloaded_file = merged_out
+                        ffmpeg_merge_status = "success"
+                    else:
+                        logger.error(f"FFmpeg merge of separate files failed: {m_proc.stderr}")
+                        downloaded_file = v_cand
+                else:
+                    downloaded_file = v_cand
+            elif video_files:
+                downloaded_file = video_files[0]
+            else:
+                downloaded_file = downloaded_files[0]
+
             file_size = downloaded_file.stat().st_size
             exists = downloaded_file.exists()
             ext = downloaded_file.suffix.lower()
@@ -1859,9 +2057,12 @@ def _sync_download(
             source_has_audio = any(_has_audio_in_format(f) for f in source_fmts)
             if not source_has_audio and info_dict.get("acodec") not in (None, "none"):
                 source_has_audio = True
+            media_info.has_audio = source_has_audio
 
             # Probe media streams to verify sound/video presence
             has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+            if has_a_stream:
+                downloaded_audio_detected = True
 
             # Emergency fallback merge if audio was available at source but missing in downloaded file
             if not has_a_stream and source_has_audio and ffmpeg_bin:
@@ -1875,36 +2076,161 @@ def _sync_download(
                         audio_fmts = [f for f in source_fmts if _has_audio_in_format(f)]
                     if audio_fmts:
                         best_a = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-                        a_url = best_a.get("url")
-                        if a_url:
-                            audio_tmp = temp_dir / f"emergency_audio_{uuid.uuid4().hex[:6]}.m4a"
-                            req = urllib.request.Request(a_url, headers=DEFAULT_HTTP_HEADERS)
-                            with urllib.request.urlopen(req, timeout=30) as resp:
-                                with open(audio_tmp, "wb") as af:
-                                    while chunk := resp.read(1024 * 512):
-                                        af.write(chunk)
-                            if audio_tmp.exists() and audio_tmp.stat().st_size > 0:
-                                merged_tmp = temp_dir / f"emergency_merged_{uuid.uuid4().hex[:6]}.mp4"
-                                cmd = [
-                                    ffmpeg_bin, "-y",
-                                    "-i", str(downloaded_file),
-                                    "-i", str(audio_tmp),
-                                    "-map", "0:v:0",
-                                    "-map", "1:a:0",
-                                    "-c:v", "copy",
-                                    "-c:a", "aac",
-                                    "-b:a", "192k",
-                                    "-movflags", "+faststart",
-                                    str(merged_tmp),
-                                ]
-                                m_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                                if m_proc.returncode == 0 and merged_tmp.exists() and merged_tmp.stat().st_size > 0:
-                                    downloaded_file = merged_tmp
-                                    file_size = downloaded_file.stat().st_size
-                                    ext = downloaded_file.suffix.lower()
-                                    has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+                        a_target = temp_dir / f"emergency_audio_{uuid.uuid4().hex[:6]}.m4a"
+                        dl_audio_ok = False
+
+                        # 1. Try yt-dlp single stream audio extraction first
+                        try:
+                            a_fmt_id = best_a.get("format_id")
+                            if a_fmt_id:
+                                a_ydl_opts = {
+                                    "format": a_fmt_id,
+                                    "outtmpl": str(a_target),
+                                    "quiet": True,
+                                    "no_warnings": True,
+                                    "socket_timeout": 15,
+                                    "http_headers": DEFAULT_HTTP_HEADERS,
+                                }
+                                with yt_dlp.YoutubeDL(a_ydl_opts) as a_ydl:
+                                    a_ydl.download([url])
+                                if a_target.exists() and a_target.stat().st_size > 0:
+                                    dl_audio_ok = True
+                        except Exception as a_dl_err:
+                            logger.debug(f"yt-dlp audio download attempt failed: {a_dl_err}")
+
+                        # 2. Fallback to direct URL download if yt-dlp did not generate file
+                        if not dl_audio_ok:
+                            a_url = best_a.get("url")
+                            if a_url:
+                                req = urllib.request.Request(a_url, headers=DEFAULT_HTTP_HEADERS)
+                                with urllib.request.urlopen(req, timeout=30) as resp:
+                                    with open(a_target, "wb") as af:
+                                        while chunk := resp.read(1024 * 512):
+                                            af.write(chunk)
+                                if a_target.exists() and a_target.stat().st_size > 0:
+                                    dl_audio_ok = True
+
+                        if dl_audio_ok:
+                            downloaded_audio_detected = True
+                            merged_tmp = temp_dir / f"emergency_merged_{uuid.uuid4().hex[:6]}.mp4"
+                            cmd = [
+                                ffmpeg_bin, "-y",
+                                "-i", str(downloaded_file),
+                                "-i", str(a_target),
+                                "-map", "0:v:0",
+                                "-map", "1:a:0",
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-b:a", "192k",
+                                "-movflags", "+faststart",
+                                str(merged_tmp),
+                            ]
+                            m_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                            if m_proc.returncode == 0 and merged_tmp.exists() and merged_tmp.stat().st_size > 0:
+                                downloaded_file = merged_tmp
+                                file_size = downloaded_file.stat().st_size
+                                ext = downloaded_file.suffix.lower()
+                                has_v_stream, has_a_stream = probe_media_streams(downloaded_file)
+                                ffmpeg_merge_status = "success"
                 except Exception as emerg_err:
                     logger.error(f"Emergency audio merge failed: {emerg_err}", exc_info=True)
+
+            is_audio_file = ext in (
+                ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"
+            ) or quality == "audio"
+
+            # Normalize video for iOS compatibility (H.264/AVC + AAC + MP4 + faststart)
+            if not is_audio_file and downloaded_file.exists():
+                downloaded_file, norm_probe = normalize_video_for_ios(
+                    downloaded_file,
+                    source_has_audio=source_has_audio,
+                    temp_dir=temp_dir,
+                )
+                file_size = downloaded_file.stat().st_size
+                ext = downloaded_file.suffix.lower()
+                has_v_stream = norm_probe.get("has_video", False)
+                has_a_stream = norm_probe.get("has_audio", False)
+                video_codec = norm_probe.get("video_codec") or "unknown"
+                audio_codec = norm_probe.get("audio_codec") or ("none" if not has_a_stream else "unknown")
+                container = norm_probe.get("container") or "unknown"
+
+                if ffmpeg_merge_status == "direct":
+                    ffmpeg_merge_status = "remux_faststart" if norm_probe.get("is_ios_compatible") else "transcode"
+
+                if norm_probe.get("width"):
+                    media_info.width = norm_probe.get("width")
+                if norm_probe.get("height"):
+                    media_info.height = norm_probe.get("height")
+
+                # Mandatory iOS checks logged cleanly
+                logger.info(f"VIDEO CHECK: codec={video_codec}")
+                logger.info(f"AUDIO CHECK: codec={audio_codec}")
+                logger.info(f"CONTAINER CHECK: {container}")
+                logger.info(f"STREAMS: video={has_v_stream} audio={has_a_stream}")
+
+                if not source_has_audio and not has_a_stream:
+                    logger.info("AUDIO SOURCE: unavailable")
+
+                # Format identification for AUDIO DEBUG
+                selected_v_fmt = "unknown"
+                selected_a_fmt = "none"
+                req_fmts = info_dict.get("requested_formats")
+                if req_fmts:
+                    v_f = next((f.get("format_id") for f in req_fmts if f.get("vcodec") != "none"), None)
+                    a_f = next((f.get("format_id") for f in req_fmts if f.get("acodec") != "none" or (f.get("audio_ext") and f.get("audio_ext") != "none")), None)
+                    selected_v_fmt = v_f or info_dict.get("format_id") or "unknown"
+                    selected_a_fmt = a_f or "embedded"
+                else:
+                    selected_v_fmt = info_dict.get("format_id") or "unknown"
+                    if _has_audio_in_format(info_dict) or source_has_audio:
+                        selected_a_fmt = "embedded" if has_a_stream else "none"
+
+                # 7 MANDATORY DIAGNOSTIC LOGS
+                logger.info(f"[AUDIO DEBUG] source_has_audio={source_has_audio}")
+                logger.info(f"[AUDIO DEBUG] selected_video_format={selected_v_fmt}")
+                logger.info(f"[AUDIO DEBUG] selected_audio_format={selected_a_fmt}")
+                logger.info(f"[AUDIO DEBUG] downloaded_audio={downloaded_audio_detected}")
+                logger.info(f"[AUDIO DEBUG] ffmpeg_merge={ffmpeg_merge_status}")
+                logger.info(f"[AUDIO DEBUG] final_video_stream={has_v_stream}")
+                logger.info(f"[AUDIO DEBUG] final_audio_stream={has_a_stream}")
+
+                # Validation per iOS & Audio requirements:
+                if not has_v_stream:
+                    record_download_finish(success=False)
+                    return DownloadResult(
+                        success=False,
+                        media_info=media_info,
+                        error_code="VIDEO_STREAM_MISSING",
+                        error_message="❌ Validation failed: Downloaded video does not contain a valid video stream.",
+                        temp_dir=temp_dir,
+                    )
+                if source_has_audio and not has_a_stream:
+                    record_download_finish(success=False)
+                    return DownloadResult(
+                        success=False,
+                        media_info=media_info,
+                        error_code="AUDIO_STREAM_MISSING",
+                        error_message="❌ Validation failed: Audio stream was available at source but missing in the final delivered video. Refusing to send silent video.",
+                        temp_dir=temp_dir,
+                    )
+                if video_codec.lower() in ("vp9", "av1", "vp09", "av01"):
+                    record_download_finish(success=False)
+                    return DownloadResult(
+                        success=False,
+                        media_info=media_info,
+                        error_code="INVALID_VIDEO_CODEC",
+                        error_message=f"❌ Validation failed: Delivered video codec is {video_codec}, which is not playable on iOS.",
+                        temp_dir=temp_dir,
+                    )
+                if "mp4" not in container.lower() and ext != ".mp4":
+                    record_download_finish(success=False)
+                    return DownloadResult(
+                        success=False,
+                        media_info=media_info,
+                        error_code="INVALID_CONTAINER",
+                        error_message=f"❌ Validation failed: Delivered container is {container}, expected mp4.",
+                        temp_dir=temp_dir,
+                    )
 
             logger.info(
                 f"[VIDEO VERIFICATION] file={downloaded_file.name}, size={file_size}, "
@@ -1989,77 +2315,54 @@ def _sync_download(
         if "there is no video in this post" in err_str or "no video formats found" in err_str or "no video in this post" in err_str:
             logger.info(f"No video format found for {url}, routing to photo/carousel fallback pipeline...")
             cached_ie = getattr(ydl, "_last_ie_result", None)
-            if cached_ie:
+            if cached_ie and cached_ie.get("entries"):
                 raw_c_entries = cached_ie.get("entries")
-                if raw_c_entries is not None:
-                    c_entries = [e for e in raw_c_entries if e]
-                    cached_ie["entries"] = c_entries
-                    if len(c_entries) > 1:
-                        carousel_items = []
-                        for idx, entry in enumerate(c_entries):
-                            if not entry:
-                                continue
-                            formats = entry.get("formats") or []
-                            item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
-                            item_type = "video" if item_is_video else "photo"
-                            item_url = None
-                            if item_is_video:
-                                if formats:
-                                    item_url = formats[-1].get("url")
-                                if not item_url:
-                                    item_url = entry.get("webpage_url") or entry.get("url") or url
-                            else:
-                                if entry.get("thumbnails"):
-                                    valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
-                                    if valid_thumbs:
-                                        best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
-                                        item_url = best_thumb.get("url")
-                                    else:
-                                        item_url = entry["thumbnails"][-1].get("url")
-                                elif entry.get("url"):
-                                    item_url = entry.get("url")
-                            carousel_items.append({
-                                "index": idx,
-                                "id": entry.get("id", f"item_{idx}"),
-                                "type": item_type,
-                                "url": item_url,
-                                "raw_entry": entry,
-                            })
-                        cached_ie["is_carousel"] = True
-                        cached_ie["carousel_items"] = carousel_items
-                        cached_ie["media_type"] = "carousel"
-                        return _sync_download(
-                            url=url,
-                            user_id=user_id,
-                            quality=quality,
-                            req_id=req_id,
-                            progress_callback=progress_callback,
-                            cached_info=cached_ie,
-                        )
-                    elif len(c_entries) == 1:
-                        cached_ie = c_entries[0]
-                        cached_ie["media_type"] = "photo"
-                        cached_ie["is_carousel"] = False
-                        return _sync_download(
-                            url=url,
-                            user_id=user_id,
-                            quality="photo",
-                            req_id=req_id,
-                            progress_callback=progress_callback,
-                            cached_info=cached_ie,
-                        )
-                else:
-                    cached_ie["media_type"] = "photo"
-                    cached_ie["is_carousel"] = False
+                c_entries = [e for e in raw_c_entries if e]
+                cached_ie["entries"] = c_entries
+                if len(c_entries) > 1:
+                    carousel_items = []
+                    for idx, entry in enumerate(c_entries):
+                        if not entry:
+                            continue
+                        formats = entry.get("formats") or []
+                        item_is_video = bool(formats and any(_is_video_format(f) for f in formats))
+                        item_type = "video" if item_is_video else "photo"
+                        item_url = None
+                        if item_is_video:
+                            if formats:
+                                item_url = formats[-1].get("url")
+                            if not item_url:
+                                item_url = entry.get("webpage_url") or entry.get("url") or url
+                        else:
+                            if entry.get("thumbnails"):
+                                valid_thumbs = [t for t in entry["thumbnails"] if isinstance(t, dict) and t.get("url")]
+                                if valid_thumbs:
+                                    best_thumb = max(valid_thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or t.get("preference", 0))
+                                    item_url = best_thumb.get("url")
+                                else:
+                                    item_url = entry["thumbnails"][-1].get("url")
+                            elif entry.get("url"):
+                                item_url = entry.get("url")
+                        carousel_items.append({
+                            "index": idx,
+                            "id": entry.get("id", f"item_{idx}"),
+                            "type": item_type,
+                            "url": item_url,
+                            "raw_entry": entry,
+                        })
+                    cached_ie["is_carousel"] = True
+                    cached_ie["carousel_items"] = carousel_items
+                    cached_ie["media_type"] = "carousel"
                     return _sync_download(
                         url=url,
                         user_id=user_id,
-                        quality="photo",
+                        quality=quality,
                         req_id=req_id,
                         progress_callback=progress_callback,
                         cached_info=cached_ie,
                     )
 
+            # Check preview extraction to accurately detect multi-item carousels vs single photos
             p_success, p_info, _ = _sync_extract_preview(url)
             if p_success and p_info:
                 if p_info.is_carousel and len(p_info.carousel_items) > 1:

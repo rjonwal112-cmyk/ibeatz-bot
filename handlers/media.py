@@ -33,6 +33,8 @@ from downloader import (
     extract_url,
     get_media_preview,
     probe_media_streams,
+    probe_media_detailed,
+    normalize_video_for_ios,
 )
 from services import (
     IN_FLIGHT_DOWNLOADS,
@@ -229,12 +231,24 @@ async def _deliver_cached_media(
     )
 
     if not is_photo and file_path and file_path.exists():
-        has_v, has_a = probe_media_streams(file_path)
-        if has_a:
-            logger.info(f"AUDIO CHECK: video={has_v} audio=True")
-        else:
+        norm_probe = probe_media_detailed(file_path)
+        if not norm_probe.get("is_ios_compatible") and file_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+            file_path, norm_probe = normalize_video_for_ios(
+                file_path,
+                source_has_audio=norm_probe.get("has_audio", True),
+            )
+        v_codec = norm_probe.get("video_codec") or "unknown"
+        a_codec = norm_probe.get("audio_codec") or ("none" if not norm_probe.get("has_audio") else "unknown")
+        cont = norm_probe.get("container") or "unknown"
+        has_v = norm_probe.get("has_video", False)
+        has_a = norm_probe.get("has_audio", False)
+
+        logger.info(f"VIDEO CHECK: codec={v_codec}")
+        logger.info(f"AUDIO CHECK: codec={a_codec}")
+        logger.info(f"CONTAINER CHECK: {cont}")
+        logger.info(f"STREAMS: video={has_v} audio={has_a}")
+        if not has_a:
             logger.info("AUDIO SOURCE: unavailable")
-            logger.info(f"AUDIO CHECK: video={has_v} audio=False")
 
     # Fast Path 1: Telegram file_id (instant 0.1s delivery)
     if entry.telegram_file_id:
@@ -542,12 +556,24 @@ async def _download_and_deliver(
                         if itype == "photo":
                             media_group.append(InputMediaPhoto(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
                         else:
-                            has_v, has_a = probe_media_streams(ipath)
-                            if has_a:
-                                logger.info(f"AUDIO CHECK: video={has_v} audio=True")
-                            else:
+                            norm_probe = probe_media_detailed(ipath)
+                            if not norm_probe.get("is_ios_compatible") and ipath.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                                ipath, norm_probe = normalize_video_for_ios(
+                                    ipath,
+                                    source_has_audio=norm_probe.get("has_audio", True),
+                                )
+                            v_codec = norm_probe.get("video_codec") or "unknown"
+                            a_codec = norm_probe.get("audio_codec") or ("none" if not norm_probe.get("has_audio") else "unknown")
+                            cont = norm_probe.get("container") or "unknown"
+                            has_v = norm_probe.get("has_video", False)
+                            has_a = norm_probe.get("has_audio", False)
+
+                            logger.info(f"VIDEO CHECK: codec={v_codec}")
+                            logger.info(f"AUDIO CHECK: codec={a_codec}")
+                            logger.info(f"CONTAINER CHECK: {cont}")
+                            logger.info(f"STREAMS: video={has_v} audio={has_a}")
+                            if not has_a:
                                 logger.info("AUDIO SOURCE: unavailable")
-                                logger.info(f"AUDIO CHECK: video={has_v} audio=False")
                             media_group.append(InputMediaVideo(media=FSInputFile(ipath, chunk_size=524288), caption=item_cap, parse_mode="HTML"))
 
                     try:
@@ -665,17 +691,63 @@ async def _download_and_deliver(
                             request_timeout=120,
                         )
             else:
-                # Validation before Telegram upload using ffprobe
-                has_v, has_a = probe_media_streams(upload_path)
-                if has_a:
-                    logger.info(f"AUDIO CHECK: video={has_v} audio=True")
-                else:
+                # Validation and normalization before Telegram upload using ffprobe
+                norm_probe = probe_media_detailed(upload_path)
+                if not norm_probe.get("is_ios_compatible") and upload_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
+                    upload_path, norm_probe = normalize_video_for_ios(
+                        upload_path,
+                        source_has_audio=norm_probe.get("has_audio", True),
+                    )
+                    media_file = FSInputFile(upload_path, chunk_size=524288)
+                    result.file_path = upload_path
+
+                v_codec = norm_probe.get("video_codec") or "unknown"
+                a_codec = norm_probe.get("audio_codec") or ("none" if not norm_probe.get("has_audio") else "unknown")
+                cont = norm_probe.get("container") or "unknown"
+                has_v = norm_probe.get("has_video", False)
+                has_a = norm_probe.get("has_audio", False)
+
+                logger.info(f"VIDEO CHECK: codec={v_codec}")
+                logger.info(f"AUDIO CHECK: codec={a_codec}")
+                logger.info(f"CONTAINER CHECK: {cont}")
+                logger.info(f"STREAMS: video={has_v} audio={has_a}")
+
+                if not has_a:
                     logger.info("AUDIO SOURCE: unavailable")
-                    logger.info(f"AUDIO CHECK: video={has_v} audio=False")
+
+                # iOS and stream validation:
+                if not has_v:
+                    logger.error(f"Validation failed: No video stream in {upload_path}")
+                    job_queue.finish_job(req_id, success=False, error="Missing video stream")
+                    if status_msg:
+                        await status_msg.edit_text("❌ Validation failed: Downloaded video does not contain a valid video stream.")
+                    return
+
+                source_has_audio = getattr(info, "has_audio", True) if info else True
+                if source_has_audio and not has_a:
+                    logger.error(f"Validation failed: Audio missing in delivered video {upload_path} despite source having audio!")
+                    job_queue.finish_job(req_id, success=False, error="Audio stream missing")
+                    if status_msg:
+                        await status_msg.edit_text("❌ Download failed: Original video contains audio, but delivered file was silent. Refusing to send silent video.")
+                    return
+
+                if v_codec.lower() in ("vp9", "av1", "vp09", "av01"):
+                    logger.error(f"Validation failed: Delivered video codec is {v_codec}, which is incompatible with iOS")
+                    job_queue.finish_job(req_id, success=False, error="Incompatible video codec")
+                    if status_msg:
+                        await status_msg.edit_text(f"❌ Validation failed: Video codec {v_codec} is not playable on iOS.")
+                    return
+
+                if "mp4" not in cont.lower() and upload_path.suffix.lower() != ".mp4":
+                    logger.error(f"Validation failed: Delivered container is {cont}, expected mp4")
+                    job_queue.finish_job(req_id, success=False, error="Incompatible container")
+                    if status_msg:
+                        await status_msg.edit_text(f"❌ Validation failed: Container {cont} is not compatible with iOS.")
+                    return
 
                 v_duration = int(info.duration) if (info and info.duration and int(info.duration) > 0) else None
-                v_width = int(info.width) if (info and info.width and int(info.width) > 0) else None
-                v_height = int(info.height) if (info and info.height and int(info.height) > 0) else None
+                v_width = norm_probe.get("width") or (int(info.width) if (info and info.width and int(info.width) > 0) else None)
+                v_height = norm_probe.get("height") or (int(info.height) if (info and info.height and int(info.height) > 0) else None)
 
                 try:
                     sent_msg = await message.reply_video(

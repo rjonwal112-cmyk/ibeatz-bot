@@ -693,6 +693,16 @@ class DatabaseManager:
     async def cleanup(self, max_bytes: int, active_files: set[str], retention_seconds: int = 86400 * 3) -> int:
         return await asyncio.to_thread(self._cleanup_sync, max_bytes, active_files, retention_seconds)
 
+    def _purge_all_cache_sync(self) -> int:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM metadata_cache;")
+            cursor = conn.execute("DELETE FROM media_cache;")
+            return cursor.rowcount
+
+    async def purge_all_cache(self) -> int:
+        """Purges all entries from media_cache and metadata_cache."""
+        return await asyncio.to_thread(self._purge_all_cache_sync)
+
     def _shutdown_sync(self) -> None:
         if not self.db_path.exists():
             return
